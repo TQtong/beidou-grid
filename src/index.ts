@@ -24,7 +24,7 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   })
 
   // 深度监测
-  viewer.scene.globe.depthTestAgainstTerrain = true
+  // viewer.scene.globe.depthTestAgainstTerrain = true
 
   // const lngLatNE: LngLat = {
   //   lngDegree: 116,
@@ -112,45 +112,30 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   const stepLat = 4
   const stepHeight = 445280
 
+  const maxHeight = 4452800
+  let lastHeight = 0
+
   for (let lon = bboxEast.west - stepLon; lon < bboxEast.east; lon += stepLon) {
     for (let lat = bboxEast.south - stepLat; lat < bboxEast.north; lat += stepLat) {
+      lastHeight = 0
       for (
         let height = stepHeight;
-        height < 445281;
+        height < maxHeight;
         height += stepHeight
       ) {
         const centerLon = lon + stepLon / 2
         const centerLat = lat + stepLat / 2
         const code2d = Codec2D.encode({ lngDegree: centerLon, latDegree: centerLat }, 1)
-        const Rectangle = Cesium.Rectangle.fromDegrees(lon, lat, lon + stepLon, lat + stepLat)
-
-        const sideLength = Cesium.Cartesian3.distance(
-          Cesium.Cartesian3.fromDegrees(lon, lat, height),
-          Cesium.Cartesian3.fromDegrees(lon + stepLon, lat, height)
-        )
-        const sideWidth = Cesium.Cartesian3.distance(
-          Cesium.Cartesian3.fromDegrees(lon, lat, height),
-          Cesium.Cartesian3.fromDegrees(lon, lat + stepLat, height)
-        )
+        const geometry = Cesium.Rectangle.fromDegrees(lon, lat, lon + stepLon, lat + stepLat)
 
         viewer.entities.add({
-          position: Cesium.Cartesian3.fromDegrees(centerLon, centerLat, height),
-          box: {
-            dimensions: new Cesium.Cartesian3(sideLength, sideWidth, height),
+          rectangle: {
+            coordinates: geometry,
             material: Cesium.Color.fromRandom(),
-            outline: true,
-            outlineColor: Cesium.Color.BLACK,
-            outlineWidth: 1
+            height: height - stepHeight,
+            extrudedHeight: stepHeight
           }
         })
-
-        // const rectangle = viewer.entities.add({
-        //   rectangle: {
-        //     coordinates: Rectangle,
-        //     material: Cesium.Color.fromRandom(),
-        //     height
-        //   }
-        // })
         viewer.entities.add({
           position: Cesium.Cartesian3.fromDegrees(centerLon, centerLat, height),
           label: {
@@ -162,30 +147,9 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
             backgroundColor: Cesium.Color.BLACK
           }
         })
+        lastHeight = height
       }
-      // const centerLon = lon + stepLon / 2
-      // const centerLat = lat + stepLat / 2
-      // const code2d = Codec2D.encode({ lngDegree: centerLon, latDegree: centerLat }, 1)
-      // console.log(code2d)
 
-      // const Rectangle = Cesium.Rectangle.fromDegrees(lon, lat, lon + stepLon, lat + stepLat)
-      // viewer.entities.add({
-      //   rectangle: {
-      //     coordinates: Rectangle,
-      //     material: Cesium.Color.fromRandom()
-      //   }
-      // })
-      // viewer.entities.add({
-      //   position: Cesium.Cartesian3.fromDegrees(centerLon, centerLat, 1000),
-      //   label: {
-      //     text: code2d,
-      //     show: true,
-      //     font: '12px Arial',
-      //     fillColor: Cesium.Color.WHITE,
-      //     showBackground: true,
-      //     backgroundColor: Cesium.Color.BLACK
-      //   }
-      // })
     }
   }
 

@@ -2,6 +2,11 @@ import * as Cesium from 'cesium'
 import Codec3D from './plugins/codec-3d'
 import type { LngLatEle, LngLat } from './plugins/type'
 import Codec2D from './plugins/codec-2d'
+import Coordinate from 'jsts/org/locationtech/jts/geom/Coordinate'
+import GeometryFactory from 'jsts/org/locationtech/jts/geom/GeometryFactory'
+import { log } from 'mathjs'
+import GeoJsonWriter from 'jsts/org/locationtech/jts/io/GeoJsonWriter'
+import BeiDouGridUtils from './plugins1/BeiDouGridUtils'
 
 export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   const viewer = new Cesium.Viewer(elemnet, {
@@ -16,7 +21,7 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
     vrButton: false, // 如果设置为true，将创建VRButton小部件。
     scene3DOnly: true, // 每个几何实例仅以3D渲染以节省GPU内存
     infoBox: false, // 隐藏点击要素后的提示信息
-    shouldAnimate: true // 运行动画自动播放
+    shouldAnimate: true, // 运行动画自动播放
   })
 
   Cesium.createWorldTerrainAsync().then((terrainProvider) => {
@@ -76,12 +81,53 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   // console.log('珠穆朗玛峰北斗三维网格位置码', code3d)
   // console.log('珠穆朗玛峰北斗三维网格位置码解码结果', Codec3D.decode(code3d))
 
+  // const bboxEast = {
+  //   west: 73.66,
+  //   south: 3.86,
+  //   east: 135.05,
+  //   north: 53.55
+  // }
   const bboxEast = {
-    west: 73.66,
-    south: 3.86,
-    east: 135.05,
-    north: 53.55
+    west: 116.391,
+    south: 39.913,
+    east: 116.401,
+    north: 39.923,
   }
+  const code = Codec2D.encode(
+    {
+      lngDegree: (bboxEast.west + bboxEast.east) / 2,
+      latDegree: (bboxEast.south + bboxEast.north) / 2,
+    },
+    1
+  )
+  console.log('code', code)
+    const code3d = Codec3D.encode({
+      lngDegree: (bboxEast.west + bboxEast.east) / 2,
+      latDegree: (bboxEast.south + bboxEast.north) / 2,
+      elevation: 100,
+    }, 1)
+  console.log('珠穆朗玛峰北斗三维网格位置码', code3d)
+
+    // 创建一个简单的矩形几何图形（包含高度数据）
+  const coordinates: Coordinate[] = [
+    new Coordinate(116.391, 39.913, 100),
+    new Coordinate(116.401, 39.913, 100),
+    new Coordinate(116.401, 39.923, 100),
+    new Coordinate(116.391, 39.923, 100),
+    new Coordinate(116.391, 39.913, 100)
+  ]
+  const GEOMETRY_FACTORY = new GeometryFactory()
+  const geom = GEOMETRY_FACTORY.createPolygon(coordinates)
+  console.log('初始数据{}', new GeoJsonWriter().write(geom))
+  // 查询网格
+  const result = BeiDouGridUtils.find3DIntersectingGridCodes(geom, 1, 0, 0)
+  console.log('result', result)
+
+  debugger
+  //     new Coordinate(116.391, 39.913),
+  //     new Coordinate(116.401, 39.913),
+  //     new Coordinate(116.401, 39.923),
+  //     new Coordinate(116.391, 39.923),
 
   // const bboxEast = {
   //   west: 0,
@@ -93,19 +139,19 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
     west: -180,
     south: 0,
     east: 0,
-    north: 88
+    north: 88,
   }
   const bboxNorth = {
     west: 0,
     south: -88,
     east: 180,
-    north: 0
+    north: 0,
   }
   const bboxSouth = {
     west: -180,
     south: -88,
     east: 0,
-    north: 0
+    north: 0,
   }
 
   const stepLon = 6
@@ -116,40 +162,52 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   let lastHeight = 0
 
   for (let lon = bboxEast.west - stepLon; lon < bboxEast.east; lon += stepLon) {
-    for (let lat = bboxEast.south - stepLat; lat < bboxEast.north; lat += stepLat) {
+    for (
+      let lat = bboxEast.south - stepLat;
+      lat < bboxEast.north;
+      lat += stepLat
+    ) {
       lastHeight = 0
-      for (
-        let height = stepHeight;
-        height < maxHeight;
-        height += stepHeight
-      ) {
+      for (let height = stepHeight; height < maxHeight; height += stepHeight) {
         const centerLon = lon + stepLon / 2
         const centerLat = lat + stepLat / 2
-        const code2d = Codec2D.encode({ lngDegree: centerLon, latDegree: centerLat }, 1)
-        const geometry = Cesium.Rectangle.fromDegrees(lon, lat, lon + stepLon, lat + stepLat)
+        const code2d = Codec2D.encode({
+          lngDegree: centerLon,
+          latDegree: centerLat,
+        })
+        const code3d = Codec3D.encode({
+          lngDegree: centerLon,
+          latDegree: centerLat,
+          elevation: height,
+        })
+        const geometry = Cesium.Rectangle.fromDegrees(
+          lon,
+          lat,
+          lon + stepLon,
+          lat + stepLat
+        )
 
         viewer.entities.add({
           rectangle: {
             coordinates: geometry,
             material: Cesium.Color.fromRandom(),
             height: height - stepHeight,
-            extrudedHeight: stepHeight
-          }
+            extrudedHeight: stepHeight,
+          },
         })
         viewer.entities.add({
           position: Cesium.Cartesian3.fromDegrees(centerLon, centerLat, height),
           label: {
-            text: code2d,
+            text: code3d,
             show: true,
             font: '12px Arial',
             fillColor: Cesium.Color.WHITE,
             showBackground: true,
-            backgroundColor: Cesium.Color.BLACK
-          }
+            backgroundColor: Cesium.Color.BLACK,
+          },
         })
         lastHeight = height
       }
-
     }
   }
 
@@ -194,3 +252,65 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
 
   return viewer
 }
+
+// export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
+//   const viewer = new Cesium.Viewer(elemnet, {
+//     geocoder: false, // 右上角 搜索
+//     homeButton: false, // 右上角 Home
+//     sceneModePicker: false, // 右上角 2D/3D切换
+//     baseLayerPicker: false, // 右上角 地形
+//     navigationHelpButton: false, // 右上角 Help
+//     animation: true, // 左下角 圆盘动画控件
+//     timeline: true, // 时间轴
+//     fullscreenButton: false, // 右下角 全屏控件
+//     vrButton: false, // 如果设置为true，将创建VRButton小部件。
+//     scene3DOnly: true, // 每个几何实例仅以3D渲染以节省GPU内存
+//     infoBox: false, // 隐藏点击要素后的提示信息
+//     shouldAnimate: true, // 运行动画自动播放
+//   })
+
+//   Cesium.createWorldTerrainAsync().then((terrainProvider) => {
+//     viewer.terrainProvider = terrainProvider
+//   })
+
+//   const GEOMETRY_FACTORY = new GeometryFactory()
+
+//   // // 创建一个小的多边形（北京故宫区域）
+//   // const polygonCoords: Coordinate[] = [
+//   //   new Coordinate(116.391, 39.913),
+//   //   new Coordinate(116.401, 39.913),
+//   //   new Coordinate(116.401, 39.923),
+//   //   new Coordinate(116.391, 39.923),
+//   //   new Coordinate(116.391, 39.913),
+//   // ]
+
+//   // // 查找网格码层级
+//   // const targetLevel = 1
+
+//   // const polygon = GEOMETRY_FACTORY.createPolygon(polygonCoords)
+//   // console.log('初始数据{}', new GeoJsonWriter().write(polygon))
+//   // // 查找网格码
+//   // const gridCodes = BeiDouGridUtils.find2DIntersectingGridCodes(
+//   //   polygon,
+//   //   targetLevel
+//   // )
+
+//   // console.log('找到 {} 个{}级二维网格码:', gridCodes.size, targetLevel)
+
+//   // 创建一个简单的矩形几何图形（包含高度数据）
+//   const coordinates: Coordinate[] = [
+//     new Coordinate(116.391, 39.913, 100),
+//     new Coordinate(116.401, 39.913, 100),
+//     new Coordinate(116.401, 39.923, 100),
+//     new Coordinate(116.391, 39.923, 100),
+//     new Coordinate(116.391, 39.913, 100)
+//   ]
+
+//   const geom = GEOMETRY_FACTORY.createPolygon(coordinates)
+//   console.log('初始数据{}', new GeoJsonWriter().write(geom))
+//   // 查询网格
+//   const result = BeiDouGridUtils.find3DIntersectingGridCodes(geom, 8, 0, 0)
+//   console.log('result', result)
+
+//   return viewer
+// }

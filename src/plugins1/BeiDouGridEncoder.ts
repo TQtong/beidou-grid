@@ -404,7 +404,6 @@ export default class BeiDouGridEncoder {
     private static buildBinaryString(n:number, signCode:string) {
         let binaryString = new StringBuilder();
         binaryString.append(signCode); // 高度方向位
-debugger
         // 生成31位二进制表示
         for (let i = 30; i >= 0; i--) {
             binaryString.append(((n >> i) & 1).toString());
@@ -416,14 +415,14 @@ debugger
      * 构建高度编码
      */
   private static buildHeightCode(binaryString: StringBuilder, level: number, signCode: string) {
-      debugger
+      
         let heightCode = new StringBuilder();
         heightCode.append(signCode); // 高度方向位
 
         let binaryIndex = 1; // 跳过高度方向位
 
         // 根据各级网格的高度编码位数和基数，生成各级高度编码
-        for (let i = 1; i <= level; i++) {
+    for (let i = 1; i <= level; i++) {
             let bits = BeiDouGridConstants.ELEVATION_ENCODING[i as keyof typeof BeiDouGridConstants.ELEVATION_ENCODING][0]!;
             let radix = BeiDouGridConstants.ELEVATION_ENCODING[i as keyof typeof BeiDouGridConstants.ELEVATION_ENCODING][1]!;
 

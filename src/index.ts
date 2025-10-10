@@ -81,53 +81,12 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   // console.log('珠穆朗玛峰北斗三维网格位置码', code3d)
   // console.log('珠穆朗玛峰北斗三维网格位置码解码结果', Codec3D.decode(code3d))
 
-  // const bboxEast = {
-  //   west: 73.66,
-  //   south: 3.86,
-  //   east: 135.05,
-  //   north: 53.55
-  // }
   const bboxEast = {
-    west: 116.391,
-    south: 39.913,
-    east: 116.401,
-    north: 39.923,
+    west: 73.66,
+    south: 3.86,
+    east: 135.05,
+    north: 53.55
   }
-  const code = Codec2D.encode(
-    {
-      lngDegree: (bboxEast.west + bboxEast.east) / 2,
-      latDegree: (bboxEast.south + bboxEast.north) / 2,
-    },
-    1
-  )
-  console.log('code', code)
-    const code3d = Codec3D.encode({
-      lngDegree: (bboxEast.west + bboxEast.east) / 2,
-      latDegree: (bboxEast.south + bboxEast.north) / 2,
-      elevation: 100,
-    }, 1)
-  console.log('珠穆朗玛峰北斗三维网格位置码', code3d)
-
-    // 创建一个简单的矩形几何图形（包含高度数据）
-  const coordinates: Coordinate[] = [
-    new Coordinate(116.391, 39.913, 100),
-    new Coordinate(116.401, 39.913, 100),
-    new Coordinate(116.401, 39.923, 100),
-    new Coordinate(116.391, 39.923, 100),
-    new Coordinate(116.391, 39.913, 100)
-  ]
-  const GEOMETRY_FACTORY = new GeometryFactory()
-  const geom = GEOMETRY_FACTORY.createPolygon(coordinates)
-  console.log('初始数据{}', new GeoJsonWriter().write(geom))
-  // 查询网格
-  const result = BeiDouGridUtils.find3DIntersectingGridCodes(geom, 1, 0, 0)
-  console.log('result', result)
-
-  debugger
-  //     new Coordinate(116.391, 39.913),
-  //     new Coordinate(116.401, 39.913),
-  //     new Coordinate(116.401, 39.923),
-  //     new Coordinate(116.391, 39.923),
 
   // const bboxEast = {
   //   west: 0,
@@ -174,12 +133,12 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
         const code2d = Codec2D.encode({
           lngDegree: centerLon,
           latDegree: centerLat,
-        })
+        },1)
         const code3d = Codec3D.encode({
           lngDegree: centerLon,
           latDegree: centerLat,
           elevation: height,
-        })
+        },6378137, 1)
         const geometry = Cesium.Rectangle.fromDegrees(
           lon,
           lat,
@@ -190,9 +149,13 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
         viewer.entities.add({
           rectangle: {
             coordinates: geometry,
-            material: Cesium.Color.fromRandom(),
+            material: Cesium.Color.YELLOW.withAlpha(0.1),
             height: height - stepHeight,
             extrudedHeight: stepHeight,
+            // fill: false,
+            outline: true,
+            outlineColor: Cesium.Color.PURPLE,
+            outlineWidth: 1,
           },
         })
         viewer.entities.add({

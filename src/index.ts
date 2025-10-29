@@ -7,9 +7,13 @@ import GeometryFactory from 'jsts/org/locationtech/jts/geom/GeometryFactory'
 import { log } from 'mathjs'
 import GeoJsonWriter from 'jsts/org/locationtech/jts/io/GeoJsonWriter'
 import BeiDouGridUtils from './plugins1/BeiDouGridUtils'
+import BeiDouGridConstants from './plugins1/BeiDouGridConstants'
+import { Decimal } from 'decimal.js'
+
+let viewer: Cesium.Viewer 
 
 export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
-  const viewer = new Cesium.Viewer(elemnet, {
+  viewer = new Cesium.Viewer(elemnet, {
     geocoder: false, // 右上角 搜索
     homeButton: false, // 右上角 Home
     sceneModePicker: false, // 右上角 2D/3D切换
@@ -27,6 +31,13 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   Cesium.createWorldTerrainAsync().then((terrainProvider) => {
     viewer.terrainProvider = terrainProvider
   })
+
+  return viewer
+}
+
+export const createGrid = (stepHeight: number, gridSize: number, maxHeight: number, bboxEast: { west: number, south: number, east: number, north: number }) => {
+  
+  viewer.entities.removeAll()
 
   // 深度监测
   // viewer.scene.globe.depthTestAgainstTerrain = true
@@ -81,12 +92,19 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   // console.log('珠穆朗玛峰北斗三维网格位置码', code3d)
   // console.log('珠穆朗玛峰北斗三维网格位置码解码结果', Codec3D.decode(code3d))
 
-  const bboxEast = {
-    west: 73.66,
-    south: 3.86,
-    east: 135.05,
-    north: 53.55
-  }
+  // const bboxEast = {
+  //   west: 73.66,
+  //   south: 3.86,
+  //   east: 135.05,
+  //   north: 53.55,
+  // }
+
+  // const bboxEast = {
+  //   west: 97.31,
+  //   south: 21.08,
+  //   east: 106.11,
+  //   north: 29.15,
+  // }
 
   // const bboxEast = {
   //   west: 0,
@@ -113,13 +131,38 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
     north: 0,
   }
 
-  const stepLon = 6
-  const stepLat = 4
-  const stepHeight = 445280
 
-  const maxHeight = 4452800
+  /**
+   * 创建BigDecimal对象的辅助方法
+   * 使用String构造器以避免精度问题
+   */
+  const bd = (val: number) => {
+    return new Decimal(val.toString())
+  }
+
+  /**
+   * 网格尺寸数组[层级][0:经度度数, 1:纬度度数]
+   * 根据标准5.1条网格划分规则定义
+   */
+  const GRID_SIZES_DEGREES = {
+    0: [] as Decimal[], // 第0级占位
+    1: [bd(6), bd(4)], // 1级：6°×4°
+    2: [bd(0.5), bd(0.5)], // 2级：30′×30′
+    3: [bd(0.25), bd(10).div(bd(60))], // 3级：15′×10′
+    4: [bd(1).div(bd(60)), bd(1).div(bd(60))], // 4级：1′×1′
+    5: [bd(4).div(bd(3600)), bd(4).div(bd(3600))], // 5级：4″×4″
+    6: [bd(2).div(bd(3600)), bd(2).div(bd(3600))], // 6级：2″×2″
+    7: [bd(1).div(bd(4 * 3600)), bd(1).div(bd(4 * 3600))], // 7级：1/4″×1/4″
+    8: [bd(1).div(bd(32 * 3600)), bd(1).div(bd(32 * 3600))], // 8级：1/32″×1/32″
+    9: [bd(1).div(bd(256 * 3600)), bd(1).div(bd(256 * 3600))], // 9级：1/256″×1/256″
+    10: [bd(1).div(bd(2048 * 3600)), bd(1).div(bd(2048 * 3600))], // 10级：1/2048″×1/2048″
+  }
+
+
+  const stepLon = GRID_SIZES_DEGREES[gridSize as keyof typeof GRID_SIZES_DEGREES][0]!.toNumber()
+  const stepLat = GRID_SIZES_DEGREES[gridSize as keyof typeof GRID_SIZES_DEGREES][1]!.toNumber()
+
   let lastHeight = 0
-
   for (let lon = bboxEast.west - stepLon; lon < bboxEast.east; lon += stepLon) {
     for (
       let lat = bboxEast.south - stepLat;
@@ -130,15 +173,22 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
       for (let height = stepHeight; height < maxHeight; height += stepHeight) {
         const centerLon = lon + stepLon / 2
         const centerLat = lat + stepLat / 2
-        const code2d = Codec2D.encode({
-          lngDegree: centerLon,
-          latDegree: centerLat,
-        },1)
-        const code3d = Codec3D.encode({
-          lngDegree: centerLon,
-          latDegree: centerLat,
-          elevation: height,
-        },6378137, 1)
+        const code2d = Codec2D.encode(
+          {
+            lngDegree: centerLon,
+            latDegree: centerLat,
+          },
+          1
+        )
+        const code3d = Codec3D.encode(
+          {
+            lngDegree: centerLon,
+            latDegree: centerLat,
+            elevation: height,
+          },
+          6378137,
+          2
+        )
         const geometry = Cesium.Rectangle.fromDegrees(
           lon,
           lat,
@@ -212,9 +262,8 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   //     })
   //   }
   // }
-
-  return viewer
 }
+
 
 // export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
 //   const viewer = new Cesium.Viewer(elemnet, {

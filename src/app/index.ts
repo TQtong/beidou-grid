@@ -1,13 +1,6 @@
 import * as Cesium from 'cesium'
-import Codec3D from './plugins/codec-3d'
-import type { LngLatEle, LngLat } from './plugins/type'
-import Codec2D from './plugins/codec-2d'
-import Coordinate from 'jsts/org/locationtech/jts/geom/Coordinate'
-import GeometryFactory from 'jsts/org/locationtech/jts/geom/GeometryFactory'
-import { log } from 'mathjs'
-import GeoJsonWriter from 'jsts/org/locationtech/jts/io/GeoJsonWriter'
-import BeiDouGridUtils from './plugins1/BeiDouGridUtils'
-import BeiDouGridConstants from './plugins1/BeiDouGridConstants'
+import Codec3D from '../beidou-grid/legacy-codec/codec-3d'
+import Codec2D from '../beidou-grid/legacy-codec/codec-2d'
 import { Decimal } from 'decimal.js'
 
 let viewer: Cesium.Viewer 

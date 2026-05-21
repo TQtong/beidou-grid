@@ -1,6 +1,6 @@
-import type BeiDouGeoPoint from "./BeiDouGeoPoint";
-import BeiDouGridConstants from "./BeiDouGridConstants";
-import BeiDouGridUtils from "./BeiDouGridUtils";
+import type BeiDouGeoPoint from "../core/BeiDouGeoPoint";
+import BeiDouGridConstants from "../core/BeiDouGridConstants";
+import BeiDouGridUtils from "../facade/BeiDouGridUtils";
 
 export default class BeiDouGrid2D {
     /**

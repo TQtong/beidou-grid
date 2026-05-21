@@ -1,9 +1,9 @@
-import BeiDouGridConstants from './BeiDouGridConstants'
-import BeiDouGeoPoint from './BeiDouGeoPoint'
-import BeiDouGridCommonUtils from './BeiDouGridCommonUtils'
+import BeiDouGridConstants from '../core/BeiDouGridConstants'
+import BeiDouGeoPoint from '../core/BeiDouGeoPoint'
+import BeiDouGridCommonUtils from '../core/BeiDouGridCommonUtils'
 
-import { LatDirection, LngDirection } from './type'
-import StringBuilder from './StringBuilder'
+import { LatDirection, LngDirection } from '../core/type'
+import StringBuilder from '../core/StringBuilder'
 
 /**
  * 北斗网格码解码器接口

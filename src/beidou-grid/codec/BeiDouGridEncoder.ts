@@ -1,9 +1,9 @@
 import { Decimal } from 'decimal.js';
 
-import BeiDouGeoPoint from './BeiDouGeoPoint';
-import BeiDouGridConstants from './BeiDouGridConstants';
-import BeiDouGridCommonUtils from './BeiDouGridCommonUtils';
-import StringBuilder from './StringBuilder';
+import BeiDouGeoPoint from '../core/BeiDouGeoPoint';
+import BeiDouGridConstants from '../core/BeiDouGridConstants';
+import BeiDouGridCommonUtils from '../core/BeiDouGridCommonUtils';
+import StringBuilder from '../core/StringBuilder';
 
 /**
  * 北斗网格码编码器

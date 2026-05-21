@@ -1,6 +1,6 @@
 import Codec2D from "./codec-2d";
 import Codec3D from "./codec-3d";
-import {
+import type {
   LngLat,
   DecodeOption,
   LngDirection,
@@ -10,6 +10,8 @@ import {
 export {
   Codec2D,
   Codec3D,
+};
+export type {
   LngLat,
   DecodeOption,
   LngDirection,

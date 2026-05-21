@@ -1,9 +1,9 @@
-import BeiDouGridEncoder from "./BeiDouGridEncoder";
-import BeiDouGridDecoder from "./BeiDouGridDecoder";
-import BeiDouGeoPoint from "./BeiDouGeoPoint";
-import BeiDouGridCommonUtils from "./BeiDouGridCommonUtils";
-import BeiDouGrid2DRangeQuery from "./BeiDouGrid2DRangeQuery";
-import BeiDouGrid3DRangeQuery from "./BeiDouGrid3DRangeQuery";
+import BeiDouGridEncoder from "../codec/BeiDouGridEncoder";
+import BeiDouGridDecoder from "../codec/BeiDouGridDecoder";
+import BeiDouGeoPoint from "../core/BeiDouGeoPoint";
+import BeiDouGridCommonUtils from "../core/BeiDouGridCommonUtils";
+import BeiDouGrid2DRangeQuery from "../query/BeiDouGrid2DRangeQuery";
+import BeiDouGrid3DRangeQuery from "../query/BeiDouGrid3DRangeQuery";
 import Geometry from "jsts/org/locationtech/jts/geom/Geometry";
 import LineString from "jsts/org/locationtech/jts/geom/LineString";
 

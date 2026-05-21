@@ -10,10 +10,10 @@ import GeoJsonWriter from 'jsts/org/locationtech/jts/io/GeoJsonWriter'
 import OverlayOp from 'jsts/org/locationtech/jts/operation/overlay/OverlayOp'
 import Point from 'jsts/org/locationtech/jts/geom/Point'
 
-import BeiDouGridConstants from './BeiDouGridConstants';
-import BeiDouGridEncoder from './BeiDouGridEncoder';
-import BeiDouGeoPoint from './BeiDouGeoPoint';
-import BeiDouGridDecoder from './BeiDouGridDecoder';
+import BeiDouGridConstants from '../core/BeiDouGridConstants';
+import BeiDouGridEncoder from '../codec/BeiDouGridEncoder';
+import BeiDouGeoPoint from '../core/BeiDouGeoPoint';
+import BeiDouGridDecoder from '../codec/BeiDouGridDecoder';
 
 /**
  * 北斗二维网格范围查询工具类

@@ -6,15 +6,15 @@ import LineString from "jsts/org/locationtech/jts/geom/LineString";
 import Polygon from "jsts/org/locationtech/jts/geom/Polygon";
 import Envelope from "jsts/org/locationtech/jts/geom/Envelope";
 import Coordinate from "jsts/org/locationtech/jts/geom/Coordinate";
-import BeiDouGridConstants from "./BeiDouGridConstants";
-import BeiDouGridEncoder from "./BeiDouGridEncoder";
-import BeiDouGridDecoder from "./BeiDouGridDecoder";
+import BeiDouGridConstants from "../core/BeiDouGridConstants";
+import BeiDouGridEncoder from "../codec/BeiDouGridEncoder";
+import BeiDouGridDecoder from "../codec/BeiDouGridDecoder";
 import BeiDouGrid2DRangeQuery from "./BeiDouGrid2DRangeQuery";
-import BeiDouGeoPoint from "./BeiDouGeoPoint";
-import GisUtils from "./GisUtils";
-import BeiDouGridUtils from "./BeiDouGridUtils";
+import BeiDouGeoPoint from "../core/BeiDouGeoPoint";
+import GisUtils from "../core/GisUtils";
+import BeiDouGridUtils from "../facade/BeiDouGridUtils";
 
-import StringBuilder from "./StringBuilder";
+import StringBuilder from "../core/StringBuilder";
 
 /**
  * 北斗三维网格范围查询工具类

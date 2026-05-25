@@ -15,4 +15,9 @@ export { default as BeiDouGrid2DRangeQuery } from './query/BeiDouGrid2DRangeQuer
 export { default as BeiDouGrid3DRangeQuery } from './query/BeiDouGrid3DRangeQuery';
 
 export { default as BeiDouGridUtils } from './facade/BeiDouGridUtils';
-export * from './legacy-codec';
+export { Codec2D, Codec3D } from './legacy-codec';
+export type {
+  LngLat,
+  DecodeOption,
+  LngLatEle
+} from './legacy-codec';

@@ -55,9 +55,6 @@ import LineString from "jsts/org/locationtech/jts/geom/LineString";
 export default class BeiDouGridUtils {
 
     // 编码器和解码器实例
-    private static encoder = new BeiDouGridEncoder();
-    private static decoder = new BeiDouGridDecoder();
-
     /**
      * 对一个经纬度坐标进行二维编码
      *

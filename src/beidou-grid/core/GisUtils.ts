@@ -5,7 +5,7 @@ import GeometryFactory from 'jsts/org/locationtech/jts/geom/GeometryFactory';
 import Coordinate from 'jsts/org/locationtech/jts/geom/Coordinate';
 
 import BeiDouGridConstants from './BeiDouGridConstants';
-import type LineString from 'jsts/org/locationtech/jts/geom/LineString';
+import LineString from 'jsts/org/locationtech/jts/geom/LineString';
 
 export default class GisUtils {
     /**
@@ -15,13 +15,13 @@ export default class GisUtils {
      * @param distance 多少米距离填充一个点
      * @return 填充了点的线
      */
-    public static lineFillPoints(originalLine: Geometry, distance: number) {
+    public static lineFillPoints(originalLine: Geometry | LineString, distance: number) {
         if (originalLine == null) {
             return null;
         }
         const geometryFactory = new GeometryFactory();
-        if (Geometry.TYPENAME_LINESTRING === originalLine.getGeometryType()) {
-            const coordinates = (originalLine as unknown as LineString).getCoordinates();
+        if (originalLine instanceof LineString) {
+            const coordinates = originalLine.getCoordinates();
             const resultCoordinates = new Array<Coordinate>();
             for (let i = 0; i < coordinates.length - 1; i++) {
                 if (isNaN(coordinates[i].z)) {

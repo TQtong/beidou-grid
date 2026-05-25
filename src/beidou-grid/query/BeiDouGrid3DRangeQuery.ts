@@ -3,8 +3,6 @@ import moment from "moment";
 import GeometryFactory from "jsts/org/locationtech/jts/geom/GeometryFactory";
 import Geometry from "jsts/org/locationtech/jts/geom/Geometry";
 import LineString from "jsts/org/locationtech/jts/geom/LineString";
-import Polygon from "jsts/org/locationtech/jts/geom/Polygon";
-import Envelope from "jsts/org/locationtech/jts/geom/Envelope";
 import Coordinate from "jsts/org/locationtech/jts/geom/Coordinate";
 import BeiDouGridConstants from "../core/BeiDouGridConstants";
 import BeiDouGridEncoder from "../codec/BeiDouGridEncoder";
@@ -70,6 +68,9 @@ export default class BeiDouGrid3DRangeQuery {
         const result = new Set<string>();
         //获取被点填充好的线
         const newGeom = GisUtils.lineFillPoints(lineString, BeiDouGridConstants.GRID_SIZES_3D[targetLevel]);
+        if (newGeom == null) {
+            return result;
+        }
         const coordinates = newGeom.getCoordinates();
         const beiDouGeoPoints = new Set<BeiDouGeoPoint>();
         for (const coordinate of coordinates) {
@@ -362,7 +363,7 @@ export default class BeiDouGrid3DRangeQuery {
         let maxHeight = Number.MIN_VALUE;
 
         // 遍历几何图形的所有点，提取高度信息
-        for (const coord of geom.getCoordinates()) {
+        for (const coord of (geom as Geometry & { getCoordinates(): Coordinate[] }).getCoordinates()) {
             const height = isNaN(coord.z) ? 0.0 : coord.z;
             minHeight = Math.min(minHeight, height);
             maxHeight = Math.max(maxHeight, height);
@@ -374,7 +375,7 @@ export default class BeiDouGrid3DRangeQuery {
     /**
      * 为二维基础网格生成三维编码并筛选（带高度参数，以高度字段为范围）
      */
-    private static generate3DGridsFor2DBase(grid2D: string, geom: Geometry,
+    private static generate3DGridsFor2DBase(grid2D: string, _geom: Geometry,
                                                  minHeight: number, maxHeight: number,
                                                  result: Set<string>) {
         const level = this.getGridLevel(grid2D);
@@ -389,8 +390,6 @@ export default class BeiDouGrid3DRangeQuery {
         // 为每个高度索引生成编码
         for (let i = startIndex; i <= endIndex; i++) {
             const gridMinAlt = i * gridHeight;
-            const gridMaxAlt = gridMinAlt + gridHeight;
-
             // 生成高度编码
             const heightCode = BeiDouGridEncoder.encode3DHeight(gridMinAlt + gridHeight / 2, level);
 
@@ -419,7 +418,7 @@ export default class BeiDouGrid3DRangeQuery {
         const heightPoints = new Set<number>();
 
         // 遍历几何图形的所有点，提取高度信息
-        for (const coord of geom.getCoordinates()!) {
+        for (const coord of (geom as Geometry & { getCoordinates(): Coordinate[] }).getCoordinates()) {
             // 假设 Coordinate 的 z 值代表高度
             const height = isNaN(coord.z) ? 0.0 : coord.z;
             heightPoints.add(height);
@@ -467,7 +466,7 @@ export default class BeiDouGrid3DRangeQuery {
     /**
      * 判断三维网格是否有效（2.5D方案：二维空间关系 + 高度范围判断），待优化
      */
-    private static is3DGridValid(grid3D: string, geom: Geometry, queryMinAlt: number, queryMaxAlt: number) {
+    public static is3DGridValid(grid3D: string, geom: Geometry, queryMinAlt: number, queryMaxAlt: number) {
         try {
             // 解码获取网格的三维边界信息
             const swPoint = BeiDouGridDecoder.decode3D(grid3D);
@@ -569,7 +568,7 @@ export default class BeiDouGrid3DRangeQuery {
     /**
      * 创建网格边界几何图形
      */
-    private static createGridBounds(swPoint: BeiDouGeoPoint, level: number) {
+    public static createGridBounds(swPoint: BeiDouGeoPoint, level: number) {
         const gridSize = BeiDouGridConstants.GRID_SIZES_DEGREES[level as keyof typeof BeiDouGridConstants.GRID_SIZES_DEGREES][0]!.toNumber();
         const coordinates = new Array<Coordinate>(5);
         coordinates[0] = new Coordinate(swPoint.getLongitude(), swPoint.getLatitude());

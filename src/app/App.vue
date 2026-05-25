@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref, useTemplateRef } from 'vue'
-import { init, createGrid } from './index'
+import { init, createGrid, type GridCreateResult } from './index'
 
 const container = useTemplateRef('container')
 
@@ -98,22 +98,32 @@ const longitudeRangeEnd = ref<number>(106.11)
 const latitudeRange = ref<number>(21.08)
 const latitudeRangeEnd = ref<number>(29.15)
 const maxHeight = ref<number>(4452800)
-const handleHeightChange = (value: number) => {
-  createGrid( heightSelect.value, gridSizeSelect.value, maxHeight.value, {
-    west: longitudeRange.value,
-    south: latitudeRange.value,
-    east: longitudeRangeEnd.value,
-    north: latitudeRangeEnd.value
-  })
+const gridResult = ref<GridCreateResult | null>(null)
+
+const getCurrentBounds = () => {
+  return {
+    west: Number(longitudeRange.value),
+    south: Number(latitudeRange.value),
+    east: Number(longitudeRangeEnd.value),
+    north: Number(latitudeRangeEnd.value)
+  }
 }
 
-const handleGridSizeChange = (value: number) => {
-  createGrid(heightSelect.value, gridSizeSelect.value, maxHeight.value, {
-    west: longitudeRange.value,
-    south: latitudeRange.value,
-    east: longitudeRangeEnd.value,
-    north: latitudeRangeEnd.value
-  })
+const renderGrid = () => {
+  gridResult.value = createGrid(
+    Number(heightSelect.value),
+    Number(gridSizeSelect.value),
+    Number(maxHeight.value),
+    getCurrentBounds()
+  )
+}
+
+const handleHeightChange = () => {
+  renderGrid()
+}
+
+const handleGridSizeChange = () => {
+  renderGrid()
 }
 
 const handleCreateGrid = () => {
@@ -121,21 +131,11 @@ const handleCreateGrid = () => {
   longitudeRangeEnd.value = 101.47
   latitudeRange.value = 21.30
   latitudeRangeEnd.value = 23.35
-  createGrid(heightSelect.value, gridSizeSelect.value, maxHeight.value, {
-    west: longitudeRange.value,
-    south: latitudeRange.value,
-    east: longitudeRangeEnd.value,  
-    north: latitudeRangeEnd.value
-  })
+  renderGrid()
 }
 onMounted(() => {
   init(container.value as HTMLDivElement)
-  createGrid(heightSelect.value, gridSizeSelect.value, maxHeight.value, {
-    west: longitudeRange.value,
-    south: latitudeRange.value,
-    east: longitudeRangeEnd.value,
-    north: latitudeRangeEnd.value
-  })
+  renderGrid()
 })
 </script>
 
@@ -161,6 +161,13 @@ onMounted(() => {
     <el-form-item label="网格尺寸">
       <el-select v-model="gridSizeSelect" :options="gridSizeList" placeholder="请选择网格尺寸" @change="handleGridSizeChange" />
     </el-form-item>
+    <el-alert
+      v-if="gridResult"
+      :type="gridResult.status === 'skipped' ? 'warning' : 'success'"
+      :closable="false"
+      :title="gridResult.message"
+      show-icon
+    />
 
   </div>
 </template>

@@ -1,24 +1,122 @@
 import * as Cesium from 'cesium'
-import Codec3D from '../beidou-grid/legacy-codec/codec-3d'
-import Codec2D from '../beidou-grid/legacy-codec/codec-2d'
 import { Decimal } from 'decimal.js'
+import Codec3D from '../beidou-grid/legacy-codec/codec-3d'
 
-let viewer: Cesium.Viewer 
+let viewer: Cesium.Viewer
 
-export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
-  viewer = new Cesium.Viewer(elemnet, {
-    geocoder: false, // 右上角 搜索
-    homeButton: false, // 右上角 Home
-    sceneModePicker: false, // 右上角 2D/3D切换
-    baseLayerPicker: false, // 右上角 地形
-    navigationHelpButton: false, // 右上角 Help
-    animation: true, // 左下角 圆盘动画控件
-    timeline: true, // 时间轴
-    fullscreenButton: false, // 右下角 全屏控件
-    vrButton: false, // 如果设置为true，将创建VRButton小部件。
-    scene3DOnly: true, // 每个几何实例仅以3D渲染以节省GPU内存
-    infoBox: false, // 隐藏点击要素后的提示信息
-    shouldAnimate: true, // 运行动画自动播放
+type GridBounds = {
+  west: number
+  south: number
+  east: number
+  north: number
+}
+
+export type GridCreateResult = {
+  status: 'rendered' | 'skipped'
+  message: string
+  columns: number
+  rows: number
+  heightLayers: number
+  gridCount: number
+  entityCount: number
+  labelsRendered: number
+  stepLon: number
+  stepLat: number
+}
+
+const EARTH_RADIUS = 6378137
+const MAX_RENDERED_GRIDS = 20_000
+const MAX_RENDERED_LABELS = 1_000
+
+const bd = (val: number) => {
+  return new Decimal(val.toString())
+}
+
+const GRID_SIZES_DEGREES = {
+  0: [] as Decimal[],
+  1: [bd(6), bd(4)],
+  2: [bd(0.5), bd(0.5)],
+  3: [bd(0.25), bd(10).div(bd(60))],
+  4: [bd(1).div(bd(60)), bd(1).div(bd(60))],
+  5: [bd(4).div(bd(3600)), bd(4).div(bd(3600))],
+  6: [bd(2).div(bd(3600)), bd(2).div(bd(3600))],
+  7: [bd(1).div(bd(4 * 3600)), bd(1).div(bd(4 * 3600))],
+  8: [bd(1).div(bd(32 * 3600)), bd(1).div(bd(32 * 3600))],
+  9: [bd(1).div(bd(256 * 3600)), bd(1).div(bd(256 * 3600))],
+  10: [bd(1).div(bd(2048 * 3600)), bd(1).div(bd(2048 * 3600))]
+}
+
+const formatCount = (count: number) => {
+  return Number.isFinite(count) ? Math.round(count).toLocaleString('zh-CN') : 'infinity'
+}
+
+const getGridStep = (gridSize: number): [number, number] => {
+  const gridStep = GRID_SIZES_DEGREES[gridSize as keyof typeof GRID_SIZES_DEGREES]
+  if (!gridStep || gridStep.length < 2) {
+    throw new Error(`Grid level must be between 1 and 10, got ${gridSize}.`)
+  }
+  return [gridStep[0]!.toNumber(), gridStep[1]!.toNumber()]
+}
+
+const normalizeBounds = (bbox: GridBounds): GridBounds => {
+  return {
+    west: Math.min(Number(bbox.west), Number(bbox.east)),
+    south: Math.min(Number(bbox.south), Number(bbox.north)),
+    east: Math.max(Number(bbox.west), Number(bbox.east)),
+    north: Math.max(Number(bbox.south), Number(bbox.north))
+  }
+}
+
+export const estimateGridLoad = (
+  stepHeight: number,
+  gridSize: number,
+  maxHeight: number,
+  bbox: GridBounds
+): GridCreateResult => {
+  const bounds = normalizeBounds(bbox)
+  const [stepLon, stepLat] = getGridStep(Number(gridSize))
+  const width = Math.max(0, bounds.east - bounds.west)
+  const height = Math.max(0, bounds.north - bounds.south)
+  const columns = Math.ceil(width / stepLon) + 1
+  const rows = Math.ceil(height / stepLat) + 1
+  const heightLayers = Math.max(0, Math.ceil(Number(maxHeight) / Number(stepHeight)) - 1)
+  const gridCount = columns * rows * heightLayers
+  const labelsRendered = Math.min(gridCount, MAX_RENDERED_LABELS)
+  const entityCount = gridCount + labelsRendered
+  const status = gridCount > MAX_RENDERED_GRIDS ? 'skipped' : 'rendered'
+  const message =
+    status === 'skipped'
+      ? `Skipped: estimated ${formatCount(gridCount)} 3D grids exceeds the safe limit ${formatCount(MAX_RENDERED_GRIDS)}. Reduce the range, max height, or grid level.`
+      : `Estimated ${formatCount(gridCount)} 3D grids and ${formatCount(labelsRendered)} labels.`
+
+  return {
+    status,
+    message,
+    columns,
+    rows,
+    heightLayers,
+    gridCount,
+    entityCount,
+    labelsRendered,
+    stepLon,
+    stepLat
+  }
+}
+
+export const init = (element: HTMLDivElement): Cesium.Viewer => {
+  viewer = new Cesium.Viewer(element, {
+    geocoder: false,
+    homeButton: false,
+    sceneModePicker: false,
+    baseLayerPicker: false,
+    navigationHelpButton: false,
+    animation: true,
+    timeline: true,
+    fullscreenButton: false,
+    vrButton: false,
+    scene3DOnly: true,
+    infoBox: false,
+    shouldAnimate: true
   })
 
   Cesium.createWorldTerrainAsync().then((terrainProvider) => {
@@ -28,166 +126,40 @@ export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
   return viewer
 }
 
-export const createGrid = (stepHeight: number, gridSize: number, maxHeight: number, bboxEast: { west: number, south: number, east: number, north: number }) => {
-  
+export const createGrid = (
+  stepHeight: number,
+  gridSize: number,
+  maxHeight: number,
+  bbox: GridBounds
+): GridCreateResult => {
+  const bounds = normalizeBounds(bbox)
+  const estimate = estimateGridLoad(stepHeight, gridSize, maxHeight, bounds)
+
+  if (estimate.status === 'skipped') {
+    console.warn(estimate.message)
+    return estimate
+  }
+
   viewer.entities.removeAll()
 
-  // 深度监测
-  // viewer.scene.globe.depthTestAgainstTerrain = true
+  const { stepLon, stepLat } = estimate
+  let renderedLabels = 0
 
-  // const lngLatNE: LngLat = {
-  //   lngDegree: 116,
-  //   lngMinute: 18,
-  //   lngSecond: 45.37,
-  //   lngDirection: 'E',
-  //   latDegree: 39,
-  //   latMinute: 59,
-  //   latSecond: 35.38,
-  //   latDirection: 'N'
-  // }
-  // console.log('坐标: ', lngLatNE)
-  // const codeNE = Codec2D.encode(lngLatNE, 10)
-  // console.log('北斗二维网格位置码: ', codeNE)
-  // console.log('解码 => ', Codec2D.decode(codeNE))
-  // console.log('-------------------')
-  // console.log('参照 N50J47539B82553461')
-  // const referNE1 = Codec2D.refer(codeNE, 'N50J47539B82553461')
-  // console.log(referNE1)
-  // console.log('还原')
-  // const deReferNE1 = Codec2D.deRefer(referNE1)
-  // console.log(deReferNE1)
-  // console.log('-------------------')
-  // console.log('参照 N50J47539b82')
-  // const referNE2 = Codec2D.refer(codeNE, 'N50J47539b82')
-  // console.log(referNE2)
-  // console.log('还原')
-  // const deReferNE2 = Codec2D.deRefer(referNE2)
-  // console.log(deReferNE2)
-  // console.log('-------------------')
-  // console.log('参照 N50J4754909')
-  // const referNE3 = Codec2D.refer(codeNE, 'N50J4754909')
-  // console.log(referNE3)
-  // console.log('还原')
-  // const deReferNE3 = Codec2D.deRefer(referNE3)
-  // console.log(deReferNE3)
-
-  // const h = 8848.86
-  // const code = Codec3D.encodeElevation(h)
-  // console.log('珠穆朗玛峰高程方向编码', code)
-  // console.log('珠穆朗玛峰高程方向编码解码结果', Codec3D.decodeElevation(code))
-  // const zmlmf: LngLatEle = {
-  //   lngDegree: 86.9,
-  //   latDegree: 27.9,
-  //   elevation: h
-  // }
-  // console.log('珠穆朗玛峰大地坐标', zmlmf)
-  // const code3d = Codec3D.encode(zmlmf)
-  // console.log('珠穆朗玛峰北斗三维网格位置码', code3d)
-  // console.log('珠穆朗玛峰北斗三维网格位置码解码结果', Codec3D.decode(code3d))
-
-  // const bboxEast = {
-  //   west: 73.66,
-  //   south: 3.86,
-  //   east: 135.05,
-  //   north: 53.55,
-  // }
-
-  // const bboxEast = {
-  //   west: 97.31,
-  //   south: 21.08,
-  //   east: 106.11,
-  //   north: 29.15,
-  // }
-
-  // const bboxEast = {
-  //   west: 0,
-  //   south: 0,
-  //   east: 180,
-  //   north: 88
-  // }
-  const bboxWest = {
-    west: -180,
-    south: 0,
-    east: 0,
-    north: 88,
-  }
-  const bboxNorth = {
-    west: 0,
-    south: -88,
-    east: 180,
-    north: 0,
-  }
-  const bboxSouth = {
-    west: -180,
-    south: -88,
-    east: 0,
-    north: 0,
-  }
-
-
-  /**
-   * 创建BigDecimal对象的辅助方法
-   * 使用String构造器以避免精度问题
-   */
-  const bd = (val: number) => {
-    return new Decimal(val.toString())
-  }
-
-  /**
-   * 网格尺寸数组[层级][0:经度度数, 1:纬度度数]
-   * 根据标准5.1条网格划分规则定义
-   */
-  const GRID_SIZES_DEGREES = {
-    0: [] as Decimal[], // 第0级占位
-    1: [bd(6), bd(4)], // 1级：6°×4°
-    2: [bd(0.5), bd(0.5)], // 2级：30′×30′
-    3: [bd(0.25), bd(10).div(bd(60))], // 3级：15′×10′
-    4: [bd(1).div(bd(60)), bd(1).div(bd(60))], // 4级：1′×1′
-    5: [bd(4).div(bd(3600)), bd(4).div(bd(3600))], // 5级：4″×4″
-    6: [bd(2).div(bd(3600)), bd(2).div(bd(3600))], // 6级：2″×2″
-    7: [bd(1).div(bd(4 * 3600)), bd(1).div(bd(4 * 3600))], // 7级：1/4″×1/4″
-    8: [bd(1).div(bd(32 * 3600)), bd(1).div(bd(32 * 3600))], // 8级：1/32″×1/32″
-    9: [bd(1).div(bd(256 * 3600)), bd(1).div(bd(256 * 3600))], // 9级：1/256″×1/256″
-    10: [bd(1).div(bd(2048 * 3600)), bd(1).div(bd(2048 * 3600))], // 10级：1/2048″×1/2048″
-  }
-
-
-  const stepLon = GRID_SIZES_DEGREES[gridSize as keyof typeof GRID_SIZES_DEGREES][0]!.toNumber()
-  const stepLat = GRID_SIZES_DEGREES[gridSize as keyof typeof GRID_SIZES_DEGREES][1]!.toNumber()
-
-  let lastHeight = 0
-  for (let lon = bboxEast.west - stepLon; lon < bboxEast.east; lon += stepLon) {
-    for (
-      let lat = bboxEast.south - stepLat;
-      lat < bboxEast.north;
-      lat += stepLat
-    ) {
-      lastHeight = 0
+  for (let lon = bounds.west - stepLon; lon < bounds.east; lon += stepLon) {
+    for (let lat = bounds.south - stepLat; lat < bounds.north; lat += stepLat) {
       for (let height = stepHeight; height < maxHeight; height += stepHeight) {
         const centerLon = lon + stepLon / 2
         const centerLat = lat + stepLat / 2
-        const code2d = Codec2D.encode(
-          {
-            lngDegree: centerLon,
-            latDegree: centerLat,
-          },
-          1
-        )
         const code3d = Codec3D.encode(
           {
             lngDegree: centerLon,
             latDegree: centerLat,
-            elevation: height,
+            elevation: height
           },
-          6378137,
+          EARTH_RADIUS,
           2
         )
-        const geometry = Cesium.Rectangle.fromDegrees(
-          lon,
-          lat,
-          lon + stepLon,
-          lat + stepLat
-        )
+        const geometry = Cesium.Rectangle.fromDegrees(lon, lat, lon + stepLon, lat + stepLat)
 
         viewer.entities.add({
           rectangle: {
@@ -195,127 +167,34 @@ export const createGrid = (stepHeight: number, gridSize: number, maxHeight: numb
             material: Cesium.Color.YELLOW.withAlpha(0.1),
             height: height - stepHeight,
             extrudedHeight: stepHeight,
-            // fill: false,
             outline: true,
             outlineColor: Cesium.Color.PURPLE,
-            outlineWidth: 1,
-          },
+            outlineWidth: 1
+          }
         })
-        viewer.entities.add({
-          position: Cesium.Cartesian3.fromDegrees(centerLon, centerLat, height),
-          label: {
-            text: code3d,
-            show: true,
-            font: '12px Arial',
-            fillColor: Cesium.Color.WHITE,
-            showBackground: true,
-            backgroundColor: Cesium.Color.BLACK,
-          },
-        })
-        lastHeight = height
+
+        if (renderedLabels < MAX_RENDERED_LABELS) {
+          viewer.entities.add({
+            position: Cesium.Cartesian3.fromDegrees(centerLon, centerLat, height),
+            label: {
+              text: code3d,
+              show: true,
+              font: '12px Arial',
+              fillColor: Cesium.Color.WHITE,
+              showBackground: true,
+              backgroundColor: Cesium.Color.BLACK
+            }
+          })
+          renderedLabels++
+        }
       }
     }
   }
 
-  // for (let lon = bboxWest.west; lon < bboxWest.east; lon += stepLon) {
-  //   for (let lat = bboxWest.south; lat < bboxWest.north; lat += stepLat) {
-  //     // const code = Codec2D.encode({ lngDegree: lon, latDegree: lat })
-  //     const Rectangle = Cesium.Rectangle.fromDegrees(lon, lat, lon + stepLon, lat + stepLat)
-  //     viewer.entities.add({
-  //       rectangle: {
-  //         coordinates: Rectangle,
-  //         material: Cesium.Color.fromRandom()
-  //       }
-  //     })
-  //   }
-  // }
-
-  // for (let lon = bboxNorth.west; lon < bboxNorth.east; lon += stepLon) {
-  //   for (let lat = bboxNorth.south; lat < bboxNorth.north; lat += stepLat) {
-  //     // const code = Codec2D.encode({ lngDegree: lon, latDegree: lat })
-  //     const Rectangle = Cesium.Rectangle.fromDegrees(lon, lat, lon + stepLon, lat + stepLat)
-  //     viewer.entities.add({
-  //       rectangle: {
-  //         coordinates: Rectangle,
-  //         material: Cesium.Color.fromRandom()
-  //       }
-  //     })
-  //   }
-  // }
-
-  // for (let lon = bboxSouth.west; lon < bboxSouth.east; lon += stepLon) {
-  //   for (let lat = bboxSouth.south; lat < bboxSouth.north; lat += stepLat) {
-  //     // const code = Codec2D.encode({ lngDegree: lon, latDegree: lat })
-  //     const Rectangle = Cesium.Rectangle.fromDegrees(lon, lat, lon + stepLon, lat + stepLat)
-  //     viewer.entities.add({
-  //       rectangle: {
-  //         coordinates: Rectangle,
-  //         material: Cesium.Color.fromRandom()
-  //       }
-  //     })
-  //   }
-  // }
+  return {
+    ...estimate,
+    labelsRendered: renderedLabels,
+    entityCount: estimate.gridCount + renderedLabels,
+    message: `Rendered ${formatCount(estimate.gridCount)} 3D grids and ${formatCount(renderedLabels)} labels.`
+  }
 }
-
-
-// export const init = (elemnet: HTMLDivElement): Cesium.Viewer => {
-//   const viewer = new Cesium.Viewer(elemnet, {
-//     geocoder: false, // 右上角 搜索
-//     homeButton: false, // 右上角 Home
-//     sceneModePicker: false, // 右上角 2D/3D切换
-//     baseLayerPicker: false, // 右上角 地形
-//     navigationHelpButton: false, // 右上角 Help
-//     animation: true, // 左下角 圆盘动画控件
-//     timeline: true, // 时间轴
-//     fullscreenButton: false, // 右下角 全屏控件
-//     vrButton: false, // 如果设置为true，将创建VRButton小部件。
-//     scene3DOnly: true, // 每个几何实例仅以3D渲染以节省GPU内存
-//     infoBox: false, // 隐藏点击要素后的提示信息
-//     shouldAnimate: true, // 运行动画自动播放
-//   })
-
-//   Cesium.createWorldTerrainAsync().then((terrainProvider) => {
-//     viewer.terrainProvider = terrainProvider
-//   })
-
-//   const GEOMETRY_FACTORY = new GeometryFactory()
-
-//   // // 创建一个小的多边形（北京故宫区域）
-//   // const polygonCoords: Coordinate[] = [
-//   //   new Coordinate(116.391, 39.913),
-//   //   new Coordinate(116.401, 39.913),
-//   //   new Coordinate(116.401, 39.923),
-//   //   new Coordinate(116.391, 39.923),
-//   //   new Coordinate(116.391, 39.913),
-//   // ]
-
-//   // // 查找网格码层级
-//   // const targetLevel = 1
-
-//   // const polygon = GEOMETRY_FACTORY.createPolygon(polygonCoords)
-//   // console.log('初始数据{}', new GeoJsonWriter().write(polygon))
-//   // // 查找网格码
-//   // const gridCodes = BeiDouGridUtils.find2DIntersectingGridCodes(
-//   //   polygon,
-//   //   targetLevel
-//   // )
-
-//   // console.log('找到 {} 个{}级二维网格码:', gridCodes.size, targetLevel)
-
-//   // 创建一个简单的矩形几何图形（包含高度数据）
-//   const coordinates: Coordinate[] = [
-//     new Coordinate(116.391, 39.913, 100),
-//     new Coordinate(116.401, 39.913, 100),
-//     new Coordinate(116.401, 39.923, 100),
-//     new Coordinate(116.391, 39.923, 100),
-//     new Coordinate(116.391, 39.913, 100)
-//   ]
-
-//   const geom = GEOMETRY_FACTORY.createPolygon(coordinates)
-//   console.log('初始数据{}', new GeoJsonWriter().write(geom))
-//   // 查询网格
-//   const result = BeiDouGridUtils.find3DIntersectingGridCodes(geom, 8, 0, 0)
-//   console.log('result', result)
-
-//   return viewer
-// }

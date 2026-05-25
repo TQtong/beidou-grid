@@ -6,6 +6,7 @@
 
     /* Linting */
     "strict": true,
+    "noUncheckedIndexedAccess": false,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "erasableSyntaxOnly": true,

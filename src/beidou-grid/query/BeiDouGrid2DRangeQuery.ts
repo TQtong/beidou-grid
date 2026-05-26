@@ -6,7 +6,7 @@ import Envelope from 'jsts/org/locationtech/jts/geom/Envelope'
 import Coordinate from 'jsts/org/locationtech/jts/geom/Coordinate'
 import LineString from 'jsts/org/locationtech/jts/geom/LineString'
 import Polygon from 'jsts/org/locationtech/jts/geom/Polygon'
-import GeoJsonWriter from 'jsts/org/locationtech/jts/io/GeoJsonWriter'
+import GeoJSONWriter from 'jsts/org/locationtech/jts/io/GeoJSONWriter'
 import OverlayOp from 'jsts/org/locationtech/jts/operation/overlay/OverlayOp'
 import Point from 'jsts/org/locationtech/jts/geom/Point'
 
@@ -214,7 +214,7 @@ export default class BeiDouGrid2DRangeQuery {
 
         // 5. 创建多边形（闭合环）
         const polygon = BeiDouGrid2DRangeQuery.GEOMETRY_FACTORY.createPolygon([sw, se, ne, nw, sw]);
-        console.log("根据{}网格码创建对应的多边形几何{}", gridCode, new GeoJsonWriter().write(polygon));
+        console.log("根据{}网格码创建对应的多边形几何{}", gridCode, new GeoJSONWriter().write(polygon));
         return polygon;
     }
 

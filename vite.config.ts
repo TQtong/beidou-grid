@@ -7,6 +7,9 @@ import { fileURLToPath, URL } from 'node:url'
 export default defineConfig({
   base: './',
   plugins: [vue(), cesium()],
+  server: {
+    port: 8011,
+  },
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url))

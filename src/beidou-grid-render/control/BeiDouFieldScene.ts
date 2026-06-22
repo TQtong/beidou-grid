@@ -33,9 +33,6 @@ import ViewRegionResolver, { type RegionResult } from '../region/ViewRegionResol
 import GridTessellator, { type HeightRange, type Tessellation } from '../grid/GridTessellator';
 import { RENDER_DEFAULTS, levelSizeMeters } from '../render-constants';
 
-/** 采样地面高用的复用 Cartographic（避免逐帧 GC）。 */
-const _scratchCarto = new Cartographic();
-
 /** 赤道每度米长（纬向恒定近似；与 GridCubeField/DroneController 一致）。 */
 const METERS_PER_DEG_LAT = 111320.0;
 
@@ -46,6 +43,16 @@ const METERS_PER_DEG_LAT = 111320.0;
  * 仅 ≈3.8m（远小于层高），故把渲染区域收敛到「视点为中心」的此尺度窗口，保证贴地。
  */
 const MAX_GROUND_HALF_SPAN_METERS = 7000;
+
+/** 地形高程采样网格边数（N×N 个采样点覆盖窗口，求地形 min/max）。 */
+const GROUND_SAMPLE_GRID: number = 7;
+
+/**
+ * 立方体场底面在采样最低地形下再下探的余量（米）。
+ * 保证窗口内每一列的底面都不高于其脚下地形（粗采样点之间的洼地也被覆盖），
+ * 从而靠地形深度遮挡裁掉地下部分、无悬空；代价是多一层左右被埋的立方体。
+ */
+const GROUND_BASE_MARGIN_METERS = 120;
 
 /** 公开配置。所有字段可选，未给走默认。 */
 export interface BeiDouFieldConfig {
@@ -59,13 +66,22 @@ export interface BeiDouFieldConfig {
    * 且低空无人机（约 50–400m）恰落在层内。step 必须 > 0。
    */
   heightRange?: HeightRange;
+  /**
+   * 静态网格锚点中心经度（度）。给定后网格固定贴在此处一片范围上，相机倾斜/远近/
+   * 平移都不重算；不给则首帧从相机视图取一次中心并冻结。
+   */
+  anchorLonDeg?: number;
+  /** 静态网格锚点中心纬度（度）。见 anchorLonDeg。 */
+  anchorLatDeg?: number;
 }
 
-/** 解析后的内部配置（字段全部填齐）。 */
+/** 解析后的内部配置（字段全部填齐，anchor 可空表示首帧从视图取）。 */
 interface ResolvedConfig {
   levelPx: LevelPxConfig;
   maxCells: number;
   heightRange: HeightRange;
+  anchorLonDeg: number | undefined;
+  anchorLatDeg: number | undefined;
 }
 
 export default class BeiDouFieldScene {
@@ -86,25 +102,32 @@ export default class BeiDouFieldScene {
   /** 给定范围（约束区域 = 可视 ∩ 给定）；undefined = 仅用可视范围。 */
   private given: Rectangle | undefined;
 
-  /** 区域地形面高（米，贴地基准）；地形未采样时为 0（椭球面），异步采样后修正。 */
-  private groundHeightMeters = 0;
+  /** 窗口内地形最低高（米，立方体场底面基准）；未采样时 0（椭球面），异步采样后修正。 */
+  private groundMinMeters = 0;
+  /** 窗口内地形最高高（米，立方体场顶面 = 此 + 空域厚度）。 */
+  private groundMaxMeters = 600;
+  /** 窗口内地形平均高（米，喂无人机作离地基准）。 */
+  private groundCenterMeters = 0;
   /** 地面采样令牌（异步乱序丢弃用：仅最新一次结果生效）。 */
   private groundSampleSeq = 0;
-  /** 上次已采样的「地形提供方|中心点」键（去重，避免同点重复采样导致回环）。 */
+  /** 上次已采样的「地形提供方|窗口矩形」键（去重，避免同窗口重复采样导致回环）。 */
   private groundSampledKey = '';
   /** 上次采样所用地形提供方（变化时强制重采样：椭球面→世界地形）。 */
   private lastTerrainProvider: unknown;
-  /** 上一次地形瓦片待加载数（侦测「刚加载完」以触发重建、重采样地面高）。 */
-  private prevTileLoad = 0;
+
+  /**
+   * 网格锚点中心（度）——仅首帧从视图取一次，之后冻结。
+   * 静态网格的核心：网格固定贴在这片地理范围上，相机倾斜/远近/平移都不重算。
+   */
+  private frozenCenterLonDeg: number | undefined;
+  private frozenCenterLatDeg: number | undefined;
+  /** 自动模式下首帧按比例尺选定并冻结的级别（手动锁定时不用）。 */
+  private frozenAutoLevel: number | undefined;
 
   /** rAF 防抖标记。 */
   private rafPending = false;
   private destroyed = false;
 
-  /** 相机停稳事件解绑句柄。 */
-  private readonly removeMoveEnd: () => void;
-  /** 地形瓦片加载进度事件解绑句柄。 */
-  private readonly removeTileLoad: () => void;
   /** 左键点击拾取事件句柄。 */
   private readonly clickHandler: ScreenSpaceEventHandler;
 
@@ -123,15 +146,9 @@ export default class BeiDouFieldScene {
     // 无人机控制器。
     this.drone = new DroneController(viewer, this.field);
 
-    // 相机停稳 → 重建（拖动中不重建，避免抖动）——需求②比例尺联动入口。
-    this.removeMoveEnd = this.scene.camera.moveEnd.addEventListener(() => this.schedule());
-
-    // 地形瓦片加载完成（待加载数从 >0 归 0）→ 重建一次重采样地面高，纠正贴地。
-    // 首帧地形尚未就绪时立方体场暂落椭球面，瓦片到位后此事件触发自动抬到地表。
-    this.removeTileLoad = this.scene.globe.tileLoadProgressEvent.addEventListener((queued: number) => {
-      if (!this.destroyed && this.prevTileLoad > 0 && queued === 0) this.schedule();
-      this.prevTileLoad = queued;
-    });
+    // 静态网格：不再监听相机停稳 / 瓦片加载——倾斜、缩放、平移都不重算网格。
+    // 网格仅在首帧构建一次，之后只由显式操作（改级别 / 改区域 / 刷新）或地形异步
+    // 采样到位（贴地一次性纠正）触发重建，锚点中心始终冻结不变。
 
     // 左键点击 → 请求拾取（拾取/改色在 field 内于下一帧执行）——需求①点击改色入口。
     this.clickHandler = new ScreenSpaceEventHandler(this.scene.canvas);
@@ -155,6 +172,8 @@ export default class BeiDouFieldScene {
       levelPx: cfg?.levelPx ?? { ...d.levelPx },
       maxCells: cfg?.maxCells ?? d.maxCells,
       heightRange: cfg?.heightRange ?? { min: 0, max: 600, step: 120 },
+      anchorLonDeg: Number.isFinite(cfg?.anchorLonDeg) ? cfg!.anchorLonDeg : undefined,
+      anchorLatDeg: Number.isFinite(cfg?.anchorLatDeg) ? cfg!.anchorLatDeg : undefined,
     };
   }
 
@@ -201,6 +220,8 @@ export default class BeiDouFieldScene {
    */
   public setLevelOverride(level?: number): void {
     this.levelOverride = level === undefined ? undefined : CesiumMath.clamp(Math.round(level), 1, 10);
+    // 切回自动：清掉冻结的自动级别，下次重建按当前比例尺重新选一次并再冻结。
+    if (this.levelOverride === undefined) this.frozenAutoLevel = undefined;
     this.schedule();
   }
 
@@ -318,54 +339,57 @@ export default class BeiDouFieldScene {
   }
 
   /**
-   * 全链路重建：解析区域 → 选级别 → 预算降级 → 剖分 → 写入立方体场。
-   * 无可视区域（看天/与给定无交集）时隐藏立方体场。
+   * 全链路重建（静态网格）：确定/复用冻结锚点中心 → 选级别 → 围绕锚点造固定窗口 →
+   * 贴地高度区间 → 剖分 → 写入立方体场。相机倾斜/远近/平移都不会触发此方法——
+   * 只有首帧、显式操作（改级别/区域/刷新）、地形异步采样到位才会重建，且锚点不变，
+   * 故网格固定贴在同一片地理范围上，不随视角动态重算。
    */
   private rebuild(): void {
-    // 1) 解析区域（可视 ∩ 给定）。
-    const region = ViewRegionResolver.resolveRegion(this.scene, this.given);
-    if (!region) {
-      this.field.setVisible(false);
-      return;
+    // 1) 锚点中心：仅首帧从视图确定一次，之后冻结复用（静态网格的核心）。
+    if (this.frozenCenterLonDeg === undefined || this.frozenCenterLatDeg === undefined) {
+      const c = this.resolveAnchorCenterDeg();
+      if (!c) {
+        this.field.setVisible(false);
+        return; // 暂无法确定中心（看天/无范围）——下次显式触发再建。
+      }
+      this.frozenCenterLonDeg = c.lonDeg;
+      this.frozenCenterLatDeg = c.latDeg;
     }
     this.field.setVisible(true);
+    const cLon = this.frozenCenterLonDeg;
+    const cLat = this.frozenCenterLatDeg;
 
-    // 2) 选级别：手动锁优先，否则比例尺自动。
-    const autoPick = ScaleLevelSelector.pickLevel(this.scene, this.cfg.levelPx);
-    const desiredLevel = this.levelOverride ?? autoPick.level;
-
-    // 3) 预算降级：仅自动模式生效（手动锁定尊重用户选择，不降级）。
-    //    高度层数由固定 step 推出（step>0 保证），避免「step 依赖级别」的鸡生蛋。
-    const hr = this.cfg.heightRange;
-    const step = hr.step > 0 ? hr.step : 1;
-    const zPlanes = Math.max(1, Math.ceil((hr.max - hr.min) / step));
+    // 2) 级别：手动锁定优先；自动模式下首帧按比例尺选定并冻结（之后不随缩放变化）。
     let level: number;
     if (this.levelOverride !== undefined) {
-      level = desiredLevel;
+      level = this.levelOverride;
     } else {
-      level = ViewRegionResolver.clampLevelByBudget(region, desiredLevel, zPlanes, this.cfg.maxCells);
+      if (this.frozenAutoLevel === undefined) {
+        this.frozenAutoLevel = ScaleLevelSelector.pickLevel(this.scene, this.cfg.levelPx).level;
+      }
+      level = this.frozenAutoLevel;
     }
     this.activeLevel = level;
 
-    // 4) 贴地窗口：把渲染区域收敛到「视点为中心、曲率/预算安全」的有限窗口。
-    //    大区域（尤其倾斜看到地平线、computeViewRectangle 退回整片给定范围）下，
-    //    平切面网格会随地球曲率抬离地表而漂浮——收窗后曲率误差与立方体数均受控。
-    const renderRegion = this.clampRegionForGrounding(
-      region,
-      level,
-      zPlanes,
-      autoPick.centerLonDeg,
-      autoPick.centerLatDeg,
-    );
-
-    // 5) 贴地：用已缓存地面高即时渲染，同时异步采样窗口中心（≈视点）地形高，
-    //    采到新值后回调里再重建——使立方体场底面坐落于地形而非海平面（椭球面）。
-    this.requestGroundHeight(renderRegion);
+    // 3) 贴地高度区间：底面下探到窗口内地形最低处之下，顶面抬到地形最高处之上再加
+    //    配置的空域厚度。配合 globe.depthTestAgainstTerrain，每一列地表以下的立方体
+    //    被地形遮挡裁掉、只露出地表以上部分——网格随地形起伏「贴地」而非悬空平板。
+    //    高度仍为固定大地高分层（符合北斗三维格语义）；地形 min/max 由异步采样得到。
+    const hr = this.cfg.heightRange;
+    const step = hr.step > 0 ? hr.step : 1;
+    const airspace = Math.max(step, hr.max - hr.min); // 地表之上的空域厚度
     const groundedRange: HeightRange = {
-      min: this.groundHeightMeters + hr.min,
-      max: this.groundHeightMeters + hr.max,
+      min: this.groundMinMeters - GROUND_BASE_MARGIN_METERS,
+      max: this.groundMaxMeters + airspace,
       step: hr.step,
     };
+    const zPlanes = Math.max(1, Math.ceil((groundedRange.max - groundedRange.min) / step));
+
+    // 4) 固定网格窗口：以冻结锚点为中心，半跨取 min(曲率安全, 预算允许)，可选裁到给定范围。
+    const renderRegion = this.buildGridWindow(cLon, cLat, level, zPlanes);
+
+    // 5) 异步采样窗口内地形 min/max（采到新值后回调里再重建），并用当前缓存即时渲染。
+    this.requestGroundSpan(renderRegion);
 
     // 6) 剖分（纯标量；南北已夹到安全纬度内）。
     const t: Tessellation = GridTessellator.tessellate(renderRegion, level, groundedRange);
@@ -374,47 +398,42 @@ export default class BeiDouFieldScene {
     this.field.setTessellation(t);
 
     // 8) 同步地面高给无人机，使其巡航高度按「离地高」解释，与立方体层贴地对齐。
-    this.drone.setGroundHeight(this.groundHeightMeters);
+    this.drone.setGroundHeight(this.groundCenterMeters);
   }
 
   /**
-   * 把渲染区域收敛到「视点为中心」的有限窗口，半跨取 min(曲率安全, 预算允许)。
-   * 这样网格只覆盖视点周边一片，既规避大区域平切面随曲率漂浮（贴地），
-   * 又在级别锁定（不降级）时约束立方体数量。跨反子午线时不收窗（保持既有行为）。
-   *
-   * @param region          原始渲染区域（可视 ∩ 给定）
-   * @param level           当前级别
-   * @param planes          高度层数
-   * @param viewCenterLonDeg 视点（屏幕中心地面点）经度（度）
-   * @param viewCenterLatDeg 视点纬度（度）
-   * @returns 收窗后的渲染区域
+   * 确定网格锚点中心（仅首帧调用一次）：
+   *  ① 配置显式给定的锚点（确定性，默认普洱城区，与无人机巡航中心一致）——优先；
+   *  ② 否则取相机视图∩给定范围的中心（首帧用户看向处）；
+   *  ③ 再否则取给定范围中心。返回 undefined 表示暂不可定。
    */
-  private clampRegionForGrounding(
-    region: RegionResult,
-    level: number,
-    planes: number,
-    viewCenterLonDeg: number,
-    viewCenterLatDeg: number,
-  ): RegionResult {
-    if (region.crossesAntimeridian) return region;
-
-    const rect = region.rectangle;
-    const westDeg = CesiumMath.toDegrees(rect.west);
-    const eastDeg = CesiumMath.toDegrees(rect.east);
-    const southDeg = CesiumMath.toDegrees(rect.south);
-    const northDeg = CesiumMath.toDegrees(rect.north);
-
-    // 窗口中心：优先视点地面点；落在区域外（或无效）则退回区域中心。
-    let cLon = viewCenterLonDeg;
-    let cLat = viewCenterLatDeg;
-    if (
-      !Number.isFinite(cLon) || !Number.isFinite(cLat) ||
-      cLon < westDeg || cLon > eastDeg || cLat < southDeg || cLat > northDeg
-    ) {
-      cLon = (westDeg + eastDeg) / 2;
-      cLat = (southDeg + northDeg) / 2;
+  private resolveAnchorCenterDeg(): { lonDeg: number; latDeg: number } | undefined {
+    if (this.cfg.anchorLonDeg !== undefined && this.cfg.anchorLatDeg !== undefined) {
+      return { lonDeg: this.cfg.anchorLonDeg, latDeg: this.cfg.anchorLatDeg };
     }
+    const region = ViewRegionResolver.resolveRegion(this.scene, this.given);
+    if (region) {
+      const c = Rectangle.center(region.rectangle);
+      return { lonDeg: CesiumMath.toDegrees(c.longitude), latDeg: CesiumMath.toDegrees(c.latitude) };
+    }
+    if (this.given) {
+      const c = Rectangle.center(this.given);
+      return { lonDeg: CesiumMath.toDegrees(c.longitude), latDeg: CesiumMath.toDegrees(c.latitude) };
+    }
+    return undefined;
+  }
 
+  /**
+   * 以锚点中心造固定网格窗口：半跨取 min(曲率安全, 预算允许)，可选裁到给定范围。
+   * 与相机视图无关——倾斜/远近都不改变它，故网格静态固定。
+   *
+   * @param cLon  锚点经度（度）
+   * @param cLat  锚点纬度（度）
+   * @param level 当前级别
+   * @param planes 高度层数（预算估算用）
+   * @returns 固定渲染窗口
+   */
+  private buildGridWindow(cLon: number, cLat: number, level: number, planes: number): RegionResult {
     // 半跨（米）= min(曲率安全, 预算允许)。预算：每边格数 ≤ √(maxCells/层数)。
     const maxCellsPerSide = Math.max(1, Math.floor(Math.sqrt(this.cfg.maxCells / Math.max(1, planes))));
     const budgetHalfMeters = (maxCellsPerSide * levelSizeMeters(level)) / 2;
@@ -425,12 +444,23 @@ export default class BeiDouFieldScene {
     const halfLatDeg = halfMeters / METERS_PER_DEG_LAT;
     const halfLonDeg = halfMeters / (METERS_PER_DEG_LAT * cosLat);
 
-    // 窗口 ∩ 区域。
-    const w = Math.max(westDeg, cLon - halfLonDeg);
-    const e = Math.min(eastDeg, cLon + halfLonDeg);
-    const s = Math.max(southDeg, cLat - halfLatDeg);
-    const n = Math.min(northDeg, cLat + halfLatDeg);
-    if (e - w <= 1e-9 || n - s <= 1e-9) return region; // 异常兜底：不收窗
+    let w = cLon - halfLonDeg;
+    let e = cLon + halfLonDeg;
+    let s = cLat - halfLatDeg;
+    let n = cLat + halfLatDeg;
+
+    // 可选裁到给定范围（不跨反子午线时）。
+    if (this.given && this.given.west <= this.given.east) {
+      w = Math.max(w, CesiumMath.toDegrees(this.given.west));
+      e = Math.min(e, CesiumMath.toDegrees(this.given.east));
+      s = Math.max(s, CesiumMath.toDegrees(this.given.south));
+      n = Math.min(n, CesiumMath.toDegrees(this.given.north));
+      // 裁空兜底：退回纯锚点窗口（不裁）。
+      if (e - w <= 1e-9 || n - s <= 1e-9) {
+        w = cLon - halfLonDeg; e = cLon + halfLonDeg;
+        s = cLat - halfLatDeg; n = cLat + halfLatDeg;
+      }
+    }
 
     return {
       rectangle: Rectangle.fromDegrees(w, s, e, n),
@@ -441,17 +471,17 @@ export default class BeiDouFieldScene {
   }
 
   /**
-   * 异步采样渲染区域中心处的地形面高（贴地基准），采到新值后触发一次重建。
+   * 异步采样窗口内地形高程的 min/max/均值（贴地基准），采到新值后触发一次重建。
    *
-   * 用 sampleTerrainMostDetailed 直接向地形数据请求高程（比 globe.getHeight 稳健——
-   * 后者仅对当前渲染四叉树中保留的瓦片有效，常返回 undefined）。去重策略：同一
-   * 「地形提供方 + 中心点」只采样一次，避免回环；地形提供方变化（椭球面→世界地形）
-   * 时强制重采样。结果按令牌丢弃乱序回包。
+   * 在窗口上铺 N×N 粗采样点，用 sampleTerrainMostDetailed 直接向地形数据请求高程
+   * （比 globe.getHeight 稳健——后者仅对当前渲染四叉树中保留的瓦片有效，常返回
+   * undefined）。min 决定立方体场底面（再下探余量），max 决定顶面（加空域厚度），
+   * 均值喂无人机作离地基准。去重：同一「地形提供方 + 窗口矩形」只采样一次，避免
+   * 回环；地形提供方变化（椭球面→世界地形）时强制重采样；结果按令牌丢弃乱序回包。
    *
-   * @param region 渲染区域
+   * @param region 渲染区域（已收窗）
    */
-  private requestGroundHeight(region: RegionResult): void {
-    const center = Rectangle.center(region.rectangle, _scratchCarto);
+  private requestGroundSpan(region: RegionResult): void {
     const provider = this.scene.globe.terrainProvider;
 
     // 地形提供方变化（如世界地形加载完成）→ 清去重键，强制重采样。
@@ -460,25 +490,48 @@ export default class BeiDouFieldScene {
       this.groundSampledKey = '';
     }
 
-    const lonDeg = CesiumMath.toDegrees(center.longitude);
-    const latDeg = CesiumMath.toDegrees(center.latitude);
-    const key = `${lonDeg.toFixed(4)},${latDeg.toFixed(4)}`;
-    if (key === this.groundSampledKey) return; // 同点已采样，不重复请求
+    const r = region.rectangle;
+    const key = `${r.west.toFixed(4)},${r.south.toFixed(4)},${r.east.toFixed(4)},${r.north.toFixed(4)}`;
+    if (key === this.groundSampledKey) return; // 同窗口已采样，不重复请求
     this.groundSampledKey = key;
 
+    // 在窗口上铺 N×N 采样点（区域已 clamp，不跨反子午线，直接线性插值经纬度）。
+    const N = GROUND_SAMPLE_GRID;
+    const samples: Cartographic[] = [];
+    for (let jy = 0; jy < N; jy++) {
+      const ty = N === 1 ? 0.5 : jy / (N - 1);
+      const lat = r.south + (r.north - r.south) * ty;
+      for (let ix = 0; ix < N; ix++) {
+        const tx = N === 1 ? 0.5 : ix / (N - 1);
+        const lon = r.west + (r.east - r.west) * tx;
+        samples.push(new Cartographic(lon, lat, 0));
+      }
+    }
+
     const seq = ++this.groundSampleSeq;
-    const sample = new Cartographic(center.longitude, center.latitude, 0);
-    sampleTerrainMostDetailed(provider, [sample])
+    sampleTerrainMostDetailed(provider, samples)
       .then((results) => {
         if (this.destroyed || seq !== this.groundSampleSeq) return; // 过期结果丢弃
-        const h = results[0]?.height;
-        if (typeof h === 'number' && Number.isFinite(h) && Math.abs(h - this.groundHeightMeters) > 0.5) {
-          this.groundHeightMeters = h;
-          this.schedule(); // 用新地面高重建（贴地）
+        let mn = Infinity, mx = -Infinity, sum = 0, cnt = 0;
+        for (const c of results) {
+          const h = c.height;
+          if (typeof h === 'number' && Number.isFinite(h)) {
+            if (h < mn) mn = h;
+            if (h > mx) mx = h;
+            sum += h;
+            cnt++;
+          }
         }
+        if (cnt === 0) return; // 全无效（如椭球面提供方）：保持当前缓存
+        const changed =
+          Math.abs(mn - this.groundMinMeters) > 0.5 || Math.abs(mx - this.groundMaxMeters) > 0.5;
+        this.groundMinMeters = mn;
+        this.groundMaxMeters = mx;
+        this.groundCenterMeters = sum / cnt;
+        if (changed) this.schedule(); // 用新地形跨度重建（贴地）
       })
       .catch(() => {
-        // 采样失败（如提供方不支持）：保持当前地面高，下次相机停稳再试。
+        // 采样失败（如提供方不支持）：保持当前缓存，下次相机停稳再试。
         this.groundSampledKey = '';
       });
   }
@@ -513,8 +566,6 @@ export default class BeiDouFieldScene {
   public dispose(): void {
     if (this.destroyed) return;
     this.destroyed = true;
-    this.removeMoveEnd();
-    this.removeTileLoad();
     this.clickHandler.destroy();
     this.drone.destroy();
     // 从 primitives 集合移除会触发 field.destroy()。

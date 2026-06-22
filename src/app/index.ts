@@ -54,11 +54,19 @@ export const init = (element: HTMLDivElement, config?: BeiDouFieldConfig): Cesiu
     shouldAnimate: true,
   })
 
+  // 关键：开启地形深度测试。默认 false 时 Cesium 会在画主体前清空地形深度，
+  // 任何 primitive 都"穿透"地形显示；开启后地形保留深度，埋在地表下的立方体被
+  // 正确遮挡——这是立方体场"贴地"（底部被地形裁掉、只露出地表以上部分）的基础。
+  viewer.scene.globe.depthTestAgainstTerrain = true
+
   // 异步加载世界地形（立方体场底面贴近真实地表观感更好）。
   Cesium.createWorldTerrainAsync()
     .then((terrainProvider) => {
       if (viewer && !viewer.isDestroyed()) {
         viewer.terrainProvider = terrainProvider
+        // 世界地形就位后触发一次重建，重采样地形高把静态网格贴到真实地表
+        // （静态网格不再随相机移动重建，故此处需显式纠正一次贴地）。
+        fieldScene?.refresh()
       }
     })
     .catch(() => {
@@ -66,7 +74,13 @@ export const init = (element: HTMLDivElement, config?: BeiDouFieldConfig): Cesiu
     })
 
   // 立方体场渲染编排器（构造传 viewer，内部用 viewer.scene 渲染、viewer.entities 承载无人机）。
-  fieldScene = new BeiDouFieldScene(viewer, config)
+  // 静态网格锚点默认普洱城区（= 相机定位中心 / 无人机巡航中心），网格固定贴在此处，
+  // 不随相机倾斜/远近/平移重算；调用方可在 config 里覆盖。
+  fieldScene = new BeiDouFieldScene(viewer, {
+    ...config,
+    anchorLonDeg: config?.anchorLonDeg ?? PUER_CENTER.lon,
+    anchorLatDeg: config?.anchorLatDeg ?? PUER_CENTER.lat,
+  })
 
   // 边界加载器（独立图层，挂在场景 primitives 上）。
   boundaryLoader = new GeoJsonBoundaryLoader(viewer.scene.primitives)

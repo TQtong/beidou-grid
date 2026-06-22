@@ -57,3 +57,13 @@ export {
   polarPointToCode3D,
   enumeratePolarBandsNorth,
 } from './polar-bridge';
+
+// ── 重设计：立方体场渲染路径（统一实例化立方体 + 拾取 + 无人机）──
+export { default as BeiDouFieldScene } from './control/BeiDouFieldScene';
+export type { BeiDouFieldConfig } from './control/BeiDouFieldScene';
+export { default as DroneController } from './control/DroneController';
+export type { DronePosition } from './control/DroneController';
+export { default as GridCubeField } from './core/GridCubeField';
+export type { FieldMode, PickCallback } from './core/GridCubeField';
+export { default as GridStateModel, Category } from './core/GridStateModel';
+export { default as InstancePicker } from './core/InstancePicker';

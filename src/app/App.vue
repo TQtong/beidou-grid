@@ -1,410 +1,536 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
+// ============================================================
+// App.vue — 北斗空域立方体场 · 地理空间指挥台（重设计 Demo UI）
+// 聚焦三需求：① 渲染模式(线框/填充) + 点击立方体改色 + 清除选中；
+//            ② 比例尺联动级别(自动) + 手动锁定 + 当前生效级别显示；
+//            ③ 无人机低空飞行(起飞/降落 + 高度/影响半径/速度)。
+// 视觉：暗色磨砂玻璃「指挥台」面板，青蓝主色，Element Plus 组件深色化适配。
+// ============================================================
+import { onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
 import {
   init,
   dispose,
-  setGivenRange,
-  clearGivenRange,
-  drawPointGrid,
-  updateAircraft,
-  clearAircraft,
+  setMode,
+  setFillOpacity,
+  clearSelections,
   setLevelOverride,
   getActiveLevel,
-  refreshAll,
+  setGivenRange,
+  clearGivenRange,
+  startDrone,
+  stopDrone,
+  setDroneAltitude,
+  setDroneInfluenceRadius,
+  setDroneSpeed,
   loadBoundary,
-  clearBoundary,
-  setBoundaryVisible,
   flyToPoint,
   PUER_BOUNDARY_URL,
+  PUER_CENTER,
+  type FieldMode,
 } from './index'
 
-/**
- * 不同级别下推荐的相机视距（米）——使单格在屏幕上有可见尺寸（数十像素）。
- * 经验值：cellMeters · 30 左右，下限 800m，上限 80km，避免极端。
- */
-const viewHeightForLevel = (level: number): number => {
-  // 单位：米。L1≈445km, L2≈55km, L3≈28km, L4≈1.85km, L5≈124m, L6≈62m, L7≈7.7m, L8+≈<1m
-  const cellMetersTable = [NaN, 445278, 55660, 27830, 1855.3, 123.7, 61.8, 7.7, 0.97, 0.12, 0.015]
-  const m = cellMetersTable[level] ?? 124
-  return Math.min(80000, Math.max(800, m * 30))
+/** 普洱市经纬度范围（GeoJSON bbox 近似；加载边界后由实测覆盖相机）。 */
+const PUER_BBOX = { west: 99.10, south: 22.02, east: 102.20, north: 24.13 } as const
+
+const container = useTemplateRef<HTMLDivElement>('container')
+
+// ── 需求①：渲染模式 / 填充 / 选中 ──
+const renderMode = ref<FieldMode>('wire')
+const fillOpacity = ref<number>(75) // 0..100（仅填充模式生效）
+
+// ── 需求②：级别 ──
+const levelMode = ref<number | 'auto'>(5) // 默认锁定 5 级（不再按比例尺自动选级）
+const activeLevel = ref<number>(5)
+const levelOptions = [
+  { label: '自动（按比例尺）', value: 'auto' as const },
+  ...Array.from({ length: 10 }, (_v, i) => ({ label: `${i + 1} 级`, value: i + 1 })),
+]
+
+// ── 需求③：无人机 ──
+const droneRunning = ref<boolean>(false)
+const droneAltitude = ref<number>(150) // 米
+const droneRadius = ref<number>(320) // 米（影响半径）
+const droneSpeed = ref<number>(45) // 0.05..2.0 rad/s 用 ×100 整数滑杆承载
+
+// ── 给定范围 ──
+const limitToPuer = ref<boolean>(true)
+
+// 颜色图例（与 GridStateModel 调色板一致）。
+const legend = [
+  { name: '空格', color: '#00e5ff' },
+  { name: '无人机所在格', color: '#ff3b30' },
+  { name: '无人机影响格', color: '#ff9500' },
+  { name: '选中 A', color: '#ffd60a' },
+  { name: '选中 B', color: '#30d158' },
+  { name: '选中 C', color: '#bf5af2' },
+]
+
+/** 当前生效级别轮询句柄。 */
+let levelTimer: number | undefined
+
+// ── 事件处理 ──
+
+/** 切换渲染模式（线框/填充）。 */
+const onModeChange = (mode: FieldMode): void => {
+  renderMode.value = mode
+  setMode(mode)
 }
 
-const container = useTemplateRef('container')
-
-// 折叠面板默认展开项。
-const panelActive = ref<string[]>(['level', 'range'])
-
-// 级别选项（含「自动」）。
-const levelOptions = ref<{ label: string; value: number | 'auto' }[]>([
-  { label: '自动（按比例尺）', value: 'auto' },
-  ...Array.from({ length: 10 }, (_v, i) => ({ label: `${i + 1}级`, value: i + 1 })),
-])
-
-// 表单状态。默认定位到普洱市 + 级别锁定 L5（与 onMounted 自动加载边界保持一致）。
-const levelMode = ref<number | 'auto'>(5)
-const useGivenRange = ref<boolean>(true)
-// 普洱市经纬度范围（来自 GeoJSON bbox 的近似值；首次加载边界后会被 bbox 实测覆盖）。
-const givenWest = ref<number>(99.10)
-const givenEast = ref<number>(102.20)
-const givenSouth = ref<number>(22.02)
-const givenNorth = ref<number>(24.13)
-
-// 默认目标点：普洱市中心（思茅区附近）。
-const pointLon = ref<number>(100.972)
-const pointLat = ref<number>(22.778)
-const pointHeight = ref<number>(1000)
-const pointLevel = ref<number>(5)
-
-// 默认飞行器位置：普洱市中心（思茅区附近），便于直接观察隔离格效果。
-const aircraftLon = ref<number>(100.972)
-const aircraftLat = ref<number>(22.778)
-const aircraftHeight = ref<number>(8000)
-const aircraftRunning = ref<boolean>(false)
-
-const activeLevelText = ref<string>('1')
-
-const isolationOptions = ref<{ label: string; value: number }[]>(
-  Array.from({ length: 10 }, (_v, i) => ({ label: `${i + 1}级`, value: i + 1 })),
-)
-const isolationLevel = ref<number>(5)
-const bufferRing = ref<number>(1)
-
-// 边界图层状态。
-const boundaryLoading = ref<boolean>(false)
-const boundaryLoaded = ref<boolean>(false)
-const boundaryVisible = ref<boolean>(true)
-const boundaryRingCount = ref<number>(0)
-const boundaryVertexCount = ref<number>(0)
-const boundaryError = ref<string>('')
-
-// 模拟飞行器移动定时器。
-let aircraftTimer: number | undefined
-
-const isAutoLevel = computed(() => levelMode.value === 'auto')
-
-const refreshActiveLevel = () => {
-  activeLevelText.value = String(getActiveLevel())
+/** 调整填充不透明度。 */
+const onFillOpacityChange = (v: number): void => {
+  setFillOpacity(v / 100)
 }
 
-const applyLevelMode = () => {
-  setLevelOverride(levelMode.value === 'auto' ? undefined : Number(levelMode.value))
-  // rAF 后再读，等待 rebuild 生效。
-  requestAnimationFrame(() => refreshActiveLevel())
+/** 锁定/恢复级别。 */
+const onLevelChange = (v: number | 'auto'): void => {
+  setLevelOverride(v === 'auto' ? undefined : v)
 }
 
-const applyGivenRange = () => {
-  if (useGivenRange.value) {
-    setGivenRange(
-      Number(givenWest.value),
-      Number(givenSouth.value),
-      Number(givenEast.value),
-      Number(givenNorth.value),
-    )
+/** 无人机起飞/降落切换。 */
+const onToggleDrone = (): void => {
+  if (droneRunning.value) {
+    stopDrone()
+    droneRunning.value = false
+  } else {
+    startDrone(PUER_CENTER.lon, PUER_CENTER.lat)
+    droneRunning.value = true
+  }
+}
+
+/** 调无人机高度。 */
+const onAltitudeChange = (v: number): void => {
+  setDroneAltitude(v)
+}
+
+/** 调无人机影响半径。 */
+const onRadiusChange = (v: number): void => {
+  setDroneInfluenceRadius(v)
+}
+
+/** 调无人机速度（滑杆值 ÷100 = rad/s）。 */
+const onSpeedChange = (v: number): void => {
+  setDroneSpeed(v / 100)
+}
+
+/** 切换是否限定普洱市范围。 */
+const onLimitChange = (v: boolean): void => {
+  if (v) {
+    setGivenRange(PUER_BBOX.west, PUER_BBOX.south, PUER_BBOX.east, PUER_BBOX.north)
   } else {
     clearGivenRange()
   }
-  requestAnimationFrame(() => refreshActiveLevel())
 }
 
-const applyPointGrid = () => {
-  const lon = Number(pointLon.value)
-  const lat = Number(pointLat.value)
-  const h = Number(pointHeight.value)
-  const lv = Number(pointLevel.value)
-  drawPointGrid(lon, lat, h, lv)
-  // 飞行到目标点，相机高度按级别取「可视格尺寸」。
-  flyToPoint(lon, lat, h, viewHeightForLevel(lv), 1.2)
+/** 飞回普洱市中心。 */
+const onFlyToPuer = (): void => {
+  flyToPoint(PUER_CENTER.lon, PUER_CENTER.lat, 0, 6000, 1.2)
 }
 
-const applyAircraft = (opts?: { flyTo?: boolean }) => {
-  const lon = Number(aircraftLon.value)
-  const lat = Number(aircraftLat.value)
-  const h = Number(aircraftHeight.value)
-  updateAircraft({ lon, lat, height: h })
-  if (opts?.flyTo) {
-    // 飞行到飞行器位置；视距按隔离级别（隔离格的尺寸）。
-    flyToPoint(lon, lat, h, viewHeightForLevel(isolationLevel.value), 1.2)
-  }
+/** 清除全部点击选中。 */
+const onClearSelections = (): void => {
+  clearSelections()
 }
 
-const startAircraftSim = () => {
-  if (aircraftRunning.value) return
-  aircraftRunning.value = true
-  applyAircraft({ flyTo: true })
-  // 每 500ms 飞行器经度+0.001（约 100m 向东），便于直观看见跨格隔离切换。
-  // 模拟过程中不每帧 flyTo（会打架），只在「设置位置」/启动时飞行一次。
-  aircraftTimer = window.setInterval(() => {
-    aircraftLon.value = Number((Number(aircraftLon.value) + 0.001).toFixed(6))
-    applyAircraft()
-  }, 500)
-}
-
-const stopAircraftSim = () => {
-  aircraftRunning.value = false
-  if (aircraftTimer !== undefined) {
-    window.clearInterval(aircraftTimer)
-    aircraftTimer = undefined
-  }
-  clearAircraft()
-}
-
-const handlePresetPuer = () => {
-  givenWest.value = 100.51
-  givenEast.value = 101.47
-  givenSouth.value = 21.30
-  givenNorth.value = 23.35
-  useGivenRange.value = true
-  applyGivenRange()
-}
-
-const handlePresetBeijing = () => {
-  givenWest.value = 116.0
-  givenEast.value = 116.8
-  givenSouth.value = 39.5
-  givenNorth.value = 40.2
-  useGivenRange.value = true
-  applyGivenRange()
-}
-
-const handleClearRange = () => {
-  useGivenRange.value = false
-  clearGivenRange()
-  requestAnimationFrame(() => refreshActiveLevel())
-}
-
-const handleRefresh = () => {
-  refreshAll()
-  requestAnimationFrame(() => refreshActiveLevel())
-}
-
-const handleLoadPuerBoundary = async () => {
-  boundaryError.value = ''
-  boundaryLoading.value = true
-  try {
-    const result = await loadBoundary(PUER_BOUNDARY_URL, {
-      style: { width: 3 },
-      flyTo: true,
-    })
-    if (result) {
-      boundaryLoaded.value = true
-      boundaryVisible.value = true
-      boundaryRingCount.value = result.ringCount
-      boundaryVertexCount.value = result.vertexCount
-    }
-  } catch (err) {
-    boundaryError.value = err instanceof Error ? err.message : String(err)
-  } finally {
-    boundaryLoading.value = false
-  }
-}
-
-const handleToggleBoundary = () => {
-  setBoundaryVisible(boundaryVisible.value)
-}
-
-const handleClearBoundary = () => {
-  clearBoundary()
-  boundaryLoaded.value = false
-  boundaryRingCount.value = 0
-  boundaryVertexCount.value = 0
-}
+// 滑杆 tooltip 格式化。
+const fmtMeters = (v: number): string => `${v} m`
+const fmtPercent = (v: number): string => `${v}%`
+const fmtSpeed = (v: number): string => `${(v / 100).toFixed(2)} rad/s`
 
 onMounted(async () => {
-  init(container.value as HTMLDivElement, {
-    isolationLevel: isolationLevel.value,
-    bufferRing: bufferRing.value,
-    dwellFrames: 3,
-    heightRange: { min: 0, max: 20000, step: 1000 },
-  })
+  if (!container.value) return
 
-  // ① 锁定显示级别为 L5（与 levelMode 默认值一致）。
-  applyLevelMode()
+  // 初始化（默认高度区间：离地 0–600m，5 层 ×120m；立方体场底面贴地形面）。
+  init(container.value, { heightRange: { min: 0, max: 600, step: 120 } })
 
-  // ② 应用初始给定范围（普洱市近似 bbox），让首帧只渲染该区域。
-  applyGivenRange()
-
-  // ③ 异步加载普洱市行政边界，加载完成后用 GeoJSON 精确 bbox 覆盖输入框 + 飞行相机。
-  try {
-    boundaryLoading.value = true
-    boundaryError.value = ''
-    const result = await loadBoundary(PUER_BOUNDARY_URL, {
-      style: { width: 3 },
-      flyTo: true,
-    })
-    if (result) {
-      boundaryLoaded.value = true
-      boundaryVisible.value = true
-      boundaryRingCount.value = result.ringCount
-      boundaryVertexCount.value = result.vertexCount
-      // 用 GeoJSON 实测 bbox 同步表单 + 给定范围，使网格与边界严格对齐。
-      if (result.bounds) {
-        const Cesium = await import('cesium')
-        const west = Cesium.Math.toDegrees(result.bounds.west)
-        const east = Cesium.Math.toDegrees(result.bounds.east)
-        const south = Cesium.Math.toDegrees(result.bounds.south)
-        const north = Cesium.Math.toDegrees(result.bounds.north)
-        givenWest.value = Number(west.toFixed(4))
-        givenEast.value = Number(east.toFixed(4))
-        givenSouth.value = Number(south.toFixed(4))
-        givenNorth.value = Number(north.toFixed(4))
-        applyGivenRange()
-      }
-    }
-  } catch (err) {
-    boundaryError.value = err instanceof Error ? err.message : String(err)
-  } finally {
-    boundaryLoading.value = false
+  // 应用初始 UI 状态。
+  setMode(renderMode.value)
+  setFillOpacity(fillOpacity.value / 100)
+  // 默认锁定级别（levelMode 默认 5 级）；选「自动」时传 undefined。
+  setLevelOverride(typeof levelMode.value === 'number' ? levelMode.value : undefined)
+  if (limitToPuer.value) {
+    setGivenRange(PUER_BBOX.west, PUER_BBOX.south, PUER_BBOX.east, PUER_BBOX.north)
   }
 
-  // 等 rebuild 完成读取生效级别。
-  setTimeout(() => refreshActiveLevel(), 200)
+  // 加载普洱市边界（不抢相机；init 已飞向普洱）。
+  loadBoundary(PUER_BOUNDARY_URL, { flyTo: false }).catch(() => {
+    /* 边界加载失败不阻断主流程。 */
+  })
+
+  // 轮询当前生效级别（比例尺联动后实时反映）。
+  levelTimer = window.setInterval(() => {
+    activeLevel.value = getActiveLevel()
+  }, 400)
 })
 
 onBeforeUnmount(() => {
-  if (aircraftTimer !== undefined) window.clearInterval(aircraftTimer)
+  if (levelTimer !== undefined) {
+    window.clearInterval(levelTimer)
+    levelTimer = undefined
+  }
   dispose()
 })
 </script>
 
 <template>
-  <div ref="container" id="container"></div>
-  <div class="panel">
-    <el-collapse v-model="panelActive" class="panel-collapse">
-      <el-collapse-item title="显示级别" name="level">
-        <el-form-item label="级别">
-          <el-select v-model="levelMode" placeholder="级别模式" @change="applyLevelMode">
-            <el-option
-              v-for="opt in levelOptions"
-              :key="String(opt.value)"
-              :label="opt.label"
-              :value="opt.value"
-            />
-          </el-select>
-        </el-form-item>
-        <el-tag type="info">当前生效级别：L{{ activeLevelText }}</el-tag>
-        <el-tag v-if="isAutoLevel" type="success" style="margin-left:8px">自动</el-tag>
-      </el-collapse-item>
+  <div class="stage">
+    <div ref="container" class="cesium-container"></div>
 
-      <el-collapse-item title="给定范围（管制扇区）" name="range">
-        <el-form-item label="启用给定范围">
-          <el-switch v-model="useGivenRange" @change="applyGivenRange" />
-        </el-form-item>
-        <el-form-item label="经度">
-          <el-input v-model="givenWest" placeholder="west" /> ~
-          <el-input v-model="givenEast" placeholder="east" />
-        </el-form-item>
-        <el-form-item label="纬度">
-          <el-input v-model="givenSouth" placeholder="south" /> ~
-          <el-input v-model="givenNorth" placeholder="north" />
-        </el-form-item>
-        <el-button-group>
-          <el-button type="primary" @click="applyGivenRange">应用</el-button>
-          <el-button @click="handlePresetPuer">普洱市</el-button>
-          <el-button @click="handlePresetBeijing">北京</el-button>
-          <el-button @click="handleClearRange">取消约束</el-button>
-        </el-button-group>
-      </el-collapse-item>
-
-      <el-collapse-item title="单点查询（R1）" name="point">
-        <el-form-item label="经度">
-          <el-input v-model="pointLon" />
-        </el-form-item>
-        <el-form-item label="纬度">
-          <el-input v-model="pointLat" />
-        </el-form-item>
-        <el-form-item label="高度(米)">
-          <el-input v-model="pointHeight" />
-        </el-form-item>
-        <el-form-item label="级别">
-          <el-input-number v-model="pointLevel" :min="1" :max="10" />
-        </el-form-item>
-        <el-button type="primary" @click="applyPointGrid">绘制点所在网格</el-button>
-      </el-collapse-item>
-
-      <el-collapse-item title="飞行器空域隔离" name="aircraft">
-        <el-form-item label="经度">
-          <el-input v-model="aircraftLon" />
-        </el-form-item>
-        <el-form-item label="纬度">
-          <el-input v-model="aircraftLat" />
-        </el-form-item>
-        <el-form-item label="高度(米)">
-          <el-input v-model="aircraftHeight" />
-        </el-form-item>
-        <el-form-item label="隔离级别">
-          <el-select v-model="isolationLevel" :disabled="aircraftRunning">
-            <el-option
-              v-for="opt in isolationOptions"
-              :key="opt.value"
-              :label="opt.label"
-              :value="opt.value"
-            />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="缓冲环(格)">
-          <el-input-number v-model="bufferRing" :min="0" :max="5" :disabled="aircraftRunning" />
-        </el-form-item>
-        <el-button-group>
-          <el-button type="primary" @click="applyAircraft({ flyTo: true })">设置位置并飞行</el-button>
-          <el-button v-if="!aircraftRunning" type="success" @click="startAircraftSim">开始模拟</el-button>
-          <el-button v-else type="warning" @click="stopAircraftSim">停止模拟</el-button>
-        </el-button-group>
-      </el-collapse-item>
-
-      <el-collapse-item title="区域边界 (GeoJSON)" name="boundary">
-        <el-button-group>
-          <el-button
-            type="primary"
-            :loading="boundaryLoading"
-            @click="handleLoadPuerBoundary"
-          >
-            加载普洱市边界
-          </el-button>
-          <el-button v-if="boundaryLoaded" @click="handleClearBoundary">清除</el-button>
-        </el-button-group>
-        <el-form-item v-if="boundaryLoaded" label="显示" style="margin-top:8px">
-          <el-switch v-model="boundaryVisible" @change="handleToggleBoundary" />
-        </el-form-item>
-        <el-tag v-if="boundaryLoaded" type="success" style="margin-top:4px">
-          已加载 {{ boundaryRingCount }} 环 / {{ boundaryVertexCount }} 顶点
-        </el-tag>
-        <el-alert
-          v-if="boundaryError"
-          type="error"
-          :title="`边界加载失败：${boundaryError}`"
-          show-icon
-          style="margin-top:8px"
-        />
-        <div style="font-size:12px;color:#888;margin-top:6px">
-          数据源：DataV.GeoAtlas (geo.datav.aliyun.com)
+    <aside class="console">
+      <header class="console__head">
+        <span class="console__pulse"></span>
+        <div class="console__titles">
+          <h1 class="console__title">北斗空域立方体场</h1>
+          <p class="console__subtitle">地理空间指挥台 · GeoSOT</p>
         </div>
-      </el-collapse-item>
+      </header>
 
-      <el-collapse-item title="操作" name="action">
-        <el-button @click="handleRefresh">手动刷新</el-button>
-      </el-collapse-item>
-    </el-collapse>
+      <!-- 需求①：渲染 -->
+      <section class="panel">
+        <h2 class="panel__title">渲染模式</h2>
+        <el-radio-group :model-value="renderMode" @change="onModeChange">
+          <el-radio-button value="wire">线框</el-radio-button>
+          <el-radio-button value="fill">填充</el-radio-button>
+        </el-radio-group>
+
+        <div class="field" :class="{ 'field--muted': renderMode !== 'fill' }">
+          <label class="field__label">填充不透明度</label>
+          <el-slider
+            v-model="fillOpacity"
+            :min="4"
+            :max="100"
+            :disabled="renderMode !== 'fill'"
+            :format-tooltip="fmtPercent"
+            @input="onFillOpacityChange"
+          />
+        </div>
+
+        <p class="hint">点击任意立方体循环改变其颜色：黄 → 绿 → 品红 → 还原。</p>
+        <el-button class="btn-block" size="small" plain @click="onClearSelections">
+          清除全部选中
+        </el-button>
+      </section>
+
+      <!-- 需求②：级别 -->
+      <section class="panel">
+        <h2 class="panel__title">北斗网格级别</h2>
+        <el-select :model-value="levelMode" class="select-block" @change="onLevelChange">
+          <el-option
+            v-for="opt in levelOptions"
+            :key="String(opt.value)"
+            :label="opt.label"
+            :value="opt.value"
+          />
+        </el-select>
+        <div class="metric">
+          <span class="metric__label">当前生效级别</span>
+          <span class="metric__value">L{{ activeLevel }}</span>
+        </div>
+        <p class="hint">选「自动」时，缩放地图即按比例尺动态调整级别。</p>
+      </section>
+
+      <!-- 需求③：无人机 -->
+      <section class="panel">
+        <h2 class="panel__title">无人机低空飞行</h2>
+        <el-button
+          class="btn-block"
+          :type="droneRunning ? 'danger' : 'primary'"
+          @click="onToggleDrone"
+        >
+          {{ droneRunning ? '降落' : '起飞' }}
+        </el-button>
+
+        <div class="field">
+          <label class="field__label">巡航高度</label>
+          <el-slider
+            v-model="droneAltitude"
+            :min="20"
+            :max="600"
+            :format-tooltip="fmtMeters"
+            @input="onAltitudeChange"
+          />
+        </div>
+        <div class="field">
+          <label class="field__label">影响半径</label>
+          <el-slider
+            v-model="droneRadius"
+            :min="50"
+            :max="1500"
+            :format-tooltip="fmtMeters"
+            @input="onRadiusChange"
+          />
+        </div>
+        <div class="field">
+          <label class="field__label">飞行速度</label>
+          <el-slider
+            v-model="droneSpeed"
+            :min="5"
+            :max="150"
+            :format-tooltip="fmtSpeed"
+            @input="onSpeedChange"
+          />
+        </div>
+      </section>
+
+      <!-- 给定范围 -->
+      <section class="panel">
+        <h2 class="panel__title">区域约束</h2>
+        <div class="switch-row">
+          <span class="switch-row__label">限定普洱市范围</span>
+          <el-switch :model-value="limitToPuer" @change="onLimitChange" />
+        </div>
+        <el-button class="btn-block" size="small" plain @click="onFlyToPuer">
+          飞到普洱市
+        </el-button>
+      </section>
+
+      <!-- 图例 -->
+      <section class="panel">
+        <h2 class="panel__title">颜色图例</h2>
+        <ul class="legend">
+          <li v-for="item in legend" :key="item.name" class="legend__item">
+            <span class="legend__swatch" :style="{ background: item.color }"></span>
+            <span class="legend__name">{{ item.name }}</span>
+          </li>
+        </ul>
+      </section>
+    </aside>
   </div>
 </template>
 
 <style scoped>
-#container {
-  width: 100%;
-  height: 100%;
+.stage {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  background: #04070d;
 }
-.panel {
+
+.cesium-container {
   position: absolute;
-  top: 10px;
-  left: 10px;
-  width: 420px;
-  max-height: calc(100vh - 20px);
-  overflow-y: auto;
-  background-color: rgba(255, 255, 255, 0.92);
-  padding: 8px 10px;
-  border-radius: 6px;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+  inset: 0;
 }
-.panel-collapse {
-  --el-collapse-header-bg-color: transparent;
+
+/* ── 指挥台面板 ── */
+.console {
+  position: absolute;
+  top: 18px;
+  right: 18px;
+  width: 348px;
+  max-height: calc(100vh - 36px);
+  overflow-y: auto;
+  padding: 18px 18px 22px;
+  border-radius: 16px;
+  background: linear-gradient(160deg, rgba(10, 19, 33, 0.82), rgba(6, 12, 22, 0.78));
+  backdrop-filter: blur(20px) saturate(150%);
+  -webkit-backdrop-filter: blur(20px) saturate(150%);
+  border: 1px solid rgba(53, 196, 255, 0.22);
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(120, 210, 255, 0.08);
+  color: #cfe2f4;
+  font-family: 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+}
+
+.console::-webkit-scrollbar {
+  width: 6px;
+}
+.console::-webkit-scrollbar-thumb {
+  background: rgba(53, 196, 255, 0.28);
+  border-radius: 3px;
+}
+
+.console__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding-bottom: 14px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid rgba(53, 196, 255, 0.16);
+}
+
+.console__pulse {
+  position: relative;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #35f0c4;
+  box-shadow: 0 0 0 0 rgba(53, 240, 196, 0.6);
+  animation: pulse 1.8s infinite;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(53, 240, 196, 0.55); }
+  70% { box-shadow: 0 0 0 9px rgba(53, 240, 196, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(53, 240, 196, 0); }
+}
+
+.console__title {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: #eaf5ff;
+}
+.console__subtitle {
+  margin: 2px 0 0;
+  font-size: 11px;
+  letter-spacing: 2px;
+  color: #5fa8d6;
+  text-transform: uppercase;
+}
+
+/* ── 分区 ── */
+.panel {
+  padding: 14px 0;
+  border-bottom: 1px solid rgba(53, 196, 255, 0.1);
+}
+.panel:last-child {
+  border-bottom: none;
+  padding-bottom: 2px;
+}
+.panel__title {
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  color: #8fd0f5;
+}
+
+.field {
+  margin-top: 12px;
+}
+.field--muted {
+  opacity: 0.45;
+}
+.field__label {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 12px;
+  color: #9fb8cf;
+}
+
+.hint {
+  margin: 12px 0 10px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: #7c93aa;
+}
+
+.btn-block {
+  width: 100%;
+}
+.select-block {
+  width: 100%;
+}
+
+.metric {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-top: 12px;
+  padding: 8px 12px;
+  border-radius: 9px;
+  background: rgba(53, 196, 255, 0.08);
+  border: 1px solid rgba(53, 196, 255, 0.16);
+}
+.metric__label {
+  font-size: 12px;
+  color: #9fb8cf;
+}
+.metric__value {
+  font-size: 20px;
+  font-weight: 700;
+  color: #35f0c4;
+  font-variant-numeric: tabular-nums;
+}
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.switch-row__label {
+  font-size: 12.5px;
+  color: #bcd3e8;
+}
+
+/* ── 图例 ── */
+.legend {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+}
+.legend__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.legend__swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 4px;
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.18);
+  flex: none;
+}
+.legend__name {
+  font-size: 12px;
+  color: #aec5db;
+}
+
+/* ── Element Plus 深色化适配 ── */
+:deep(.el-radio-group) {
+  width: 100%;
+  display: flex;
+}
+:deep(.el-radio-button) {
+  flex: 1;
+}
+:deep(.el-radio-button__inner) {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(53, 196, 255, 0.25);
+  color: #bcd3e8;
+}
+:deep(.el-radio-button__original-radio:checked + .el-radio-button__inner) {
+  background: rgba(53, 196, 255, 0.22);
+  border-color: rgba(53, 196, 255, 0.6);
+  color: #eaf5ff;
+  box-shadow: -1px 0 0 0 rgba(53, 196, 255, 0.6);
+}
+
+:deep(.el-slider__runway) {
+  background: rgba(255, 255, 255, 0.12);
+}
+:deep(.el-slider__bar) {
+  background: linear-gradient(90deg, #35c4ff, #35f0c4);
+}
+:deep(.el-slider__button) {
+  border-color: #35f0c4;
+  background: #0a1321;
+}
+
+:deep(.el-select__wrapper) {
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: 0 0 0 1px rgba(53, 196, 255, 0.25) inset;
+}
+:deep(.el-select__placeholder),
+:deep(.el-select__selected-item) {
+  color: #d7e6f5;
+}
+
+:deep(.el-button) {
+  font-weight: 600;
+}
+:deep(.el-button.is-plain) {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(53, 196, 255, 0.3);
+  color: #bcd3e8;
+}
+:deep(.el-button.is-plain:hover) {
+  background: rgba(53, 196, 255, 0.14);
+  border-color: rgba(53, 196, 255, 0.6);
+  color: #eaf5ff;
 }
 </style>

@@ -49,15 +49,24 @@ import {
   RENDER_FRAGMENT_SHADER,
   RENDER_VERTEX_SHADER,
 } from './GridFieldShaders';
-import GridStateModel from './GridStateModel';
+import GridStateModel, { type GridCellInfo } from './GridStateModel';
 import InstancePicker from './InstancePicker';
 import type { Tessellation } from '../grid/GridTessellator';
+import { pointToCode2D, pointToCode3D } from '../geo-bridge';
 
 /** 渲染模式：线框 / 填充。 */
 export type FieldMode = 'wire' | 'fill';
 
 /** 拾取回调：参数为被点中的实例号（-1 表示点到空白）。 */
 export type PickCallback = (instanceId: number) => void;
+
+/** 拾取到的网格编码与格信息。 */
+export interface PickedGridInfo extends GridCellInfo {
+  /** 二维北斗网格编码。 */
+  code2D: string;
+  /** 三维北斗网格编码。 */
+  code3D: string;
+}
 
 /** 赤道每度米长（纬向恒定近似，经向再乘 cos(lat)）。 */
 const METERS_PER_DEG = 111320.0;
@@ -306,6 +315,30 @@ export default class GridCubeField {
   public requestPick(screenX: number, screenY: number, cb?: PickCallback): void {
     if (this.destroyed) return;
     this.pending = { x: screenX, y: screenY, cb };
+  }
+
+  /**
+   * 把拾取实例号反查为北斗网格编码与展示信息。
+   *
+   * @param instanceId 拾取返回的实例号
+   * @returns 网格编码信息；越界或编码失败返回 undefined
+   */
+  public getPickedGridInfo(instanceId: number): PickedGridInfo | undefined {
+    const cell = this.state.getCellInfo(instanceId);
+    if (!cell) return undefined;
+
+    try {
+      const { lonDeg, latDeg, heightMeters } = cell.center;
+      return {
+        ...cell,
+        code2D: pointToCode2D(lonDeg, latDeg, cell.level),
+        code3D: pointToCode3D(lonDeg, latDeg, heightMeters, cell.level),
+      };
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn('[GridCubeField] 网格编码生成失败（已忽略）：', err);
+      return undefined;
+    }
   }
 
   /**

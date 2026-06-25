@@ -26,7 +26,7 @@ import {
   type Viewer,
 } from 'cesium';
 
-import GridCubeField, { type FieldMode } from '../core/GridCubeField';
+import GridCubeField, { type FieldMode, type PickedGridInfo } from '../core/GridCubeField';
 import DroneController from './DroneController';
 import ScaleLevelSelector, { type LevelPxConfig } from '../level/ScaleLevelSelector';
 import ViewRegionResolver, { type RegionResult } from '../region/ViewRegionResolver';
@@ -53,6 +53,9 @@ const GROUND_SAMPLE_GRID: number = 7;
  * 从而靠地形深度遮挡裁掉地下部分、无悬空；代价是多一层左右被埋的立方体。
  */
 const GROUND_BASE_MARGIN_METERS = 120;
+
+/** 网格拾取监听器；undefined 表示点到空白或拾取失败。 */
+export type GridPickListener = (info: PickedGridInfo | undefined) => void;
 
 /** 公开配置。所有字段可选，未给走默认。 */
 export interface BeiDouFieldConfig {
@@ -130,6 +133,8 @@ export default class BeiDouFieldScene {
 
   /** 左键点击拾取事件句柄。 */
   private readonly clickHandler: ScreenSpaceEventHandler;
+  /** 网格拾取结果监听器（应用层用于显示编码）。 */
+  private pickListener: GridPickListener | undefined;
 
   /**
    * @param viewer Cesium Viewer（来自应用层；其 scene 用于渲染，其 entities 用于无人机）
@@ -154,7 +159,10 @@ export default class BeiDouFieldScene {
     this.clickHandler = new ScreenSpaceEventHandler(this.scene.canvas);
     this.clickHandler.setInputAction((movement: ScreenSpaceEventHandler.PositionedEvent) => {
       if (this.destroyed) return;
-      this.field.requestPick(movement.position.x, movement.position.y);
+      this.field.requestPick(movement.position.x, movement.position.y, (instanceId) => {
+        const info = instanceId >= 0 ? this.field.getPickedGridInfo(instanceId) : undefined;
+        this.pickListener?.(info);
+      });
     }, ScreenSpaceEventType.LEFT_CLICK);
 
     // 首次构建。
@@ -207,6 +215,21 @@ export default class BeiDouFieldScene {
   /** 清空全部点击选中（不影响无人机标记）。 */
   public clearSelections(): void {
     this.field.clearSelections();
+  }
+
+  /**
+   * 监听场景内网格拾取结果。
+   *
+   * @param listener 拾取监听器
+   * @returns 取消监听函数
+   */
+  public onGridPick(listener: GridPickListener): () => void {
+    this.pickListener = listener;
+    return () => {
+      if (this.pickListener === listener) {
+        this.pickListener = undefined;
+      }
+    };
   }
 
   // ──────────────────────────────────────────────

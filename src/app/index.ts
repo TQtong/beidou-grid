@@ -18,6 +18,8 @@ import {
   GeoJsonBoundaryLoader,
   type BoundaryLoadResult,
   type BoundaryStyle,
+  type GridPickListener,
+  type PickedGridInfo,
 } from '../beidou-grid-render'
 
 /** 普洱市行政边界（GeoJSON，DataV 阿里云）。 */
@@ -111,6 +113,11 @@ export const setFillOpacity = (opacity: number): void => {
 /** 清空全部点击选中。 */
 export const clearSelections = (): void => {
   fieldScene?.clearSelections()
+}
+
+/** 监听点击拾取到的网格编码；返回取消监听函数。 */
+export const onGridPick = (listener: GridPickListener): (() => void) => {
+  return fieldScene?.onGridPick(listener) ?? (() => undefined)
 }
 
 // ──────────────────────────────────────────────
@@ -265,4 +272,11 @@ export const dispose = (): void => {
   viewer = undefined
 }
 
-export type { BeiDouFieldConfig, FieldMode, HeightRange, BoundaryLoadResult, BoundaryStyle }
+export type {
+  BeiDouFieldConfig,
+  FieldMode,
+  HeightRange,
+  BoundaryLoadResult,
+  BoundaryStyle,
+  PickedGridInfo,
+}

@@ -24,9 +24,11 @@ import {
   setDroneSpeed,
   loadBoundary,
   flyToPoint,
+  onGridPick,
   PUER_BOUNDARY_URL,
   PUER_CENTER,
   type FieldMode,
+  type PickedGridInfo,
 } from './index'
 
 /** 普洱市经纬度范围（GeoJSON bbox 近似；加载边界后由实测覆盖相机）。 */
@@ -45,6 +47,9 @@ const levelOptions = [
   { label: '自动（按比例尺）', value: 'auto' as const },
   ...Array.from({ length: 10 }, (_v, i) => ({ label: `${i + 1} 级`, value: i + 1 })),
 ]
+
+// ── 拾取网格编码 ──
+const pickedGrid = ref<PickedGridInfo | undefined>(undefined)
 
 // ── 需求③：无人机 ──
 const droneRunning = ref<boolean>(false)
@@ -67,6 +72,8 @@ const legend = [
 
 /** 当前生效级别轮询句柄。 */
 let levelTimer: number | undefined
+/** 网格拾取监听解绑句柄。 */
+let offGridPick: (() => void) | undefined
 
 // ── 事件处理 ──
 
@@ -129,18 +136,24 @@ const onFlyToPuer = (): void => {
 /** 清除全部点击选中。 */
 const onClearSelections = (): void => {
   clearSelections()
+  pickedGrid.value = undefined
 }
 
 // 滑杆 tooltip 格式化。
 const fmtMeters = (v: number): string => `${v} m`
 const fmtPercent = (v: number): string => `${v}%`
 const fmtSpeed = (v: number): string => `${(v / 100).toFixed(2)} rad/s`
+const fmtCoord = (v: number): string => v.toFixed(6)
+const fmtHeight = (v: number): string => `${v.toFixed(1)} m`
 
 onMounted(async () => {
   if (!container.value) return
 
   // 初始化（默认高度区间：离地 0–600m，5 层 ×120m；立方体场底面贴地形面）。
   init(container.value, { heightRange: { min: 0, max: 600, step: 120 } })
+  offGridPick = onGridPick((info) => {
+    pickedGrid.value = info
+  })
 
   // 应用初始 UI 状态。
   setMode(renderMode.value)
@@ -167,10 +180,10 @@ onBeforeUnmount(() => {
     window.clearInterval(levelTimer)
     levelTimer = undefined
   }
+  offGridPick?.()
+  offGridPick = undefined
   dispose()
 })
-
-onBeforeUnmount(() => offClick?.())
 </script>
 
 <template>
@@ -210,6 +223,41 @@ onBeforeUnmount(() => offClick?.())
         <el-button class="btn-block" size="small" plain @click="onClearSelections">
           清除全部选中
         </el-button>
+      </section>
+
+      <section class="panel">
+        <h2 class="panel__title">拾取网格编码</h2>
+        <div v-if="pickedGrid" class="pick-readout">
+          <div class="pick-code-row">
+            <span class="pick-code-row__label">三维编码</span>
+            <code class="pick-code">{{ pickedGrid.code3D }}</code>
+          </div>
+          <div class="pick-code-row">
+            <span class="pick-code-row__label">二维编码</span>
+            <code class="pick-code">{{ pickedGrid.code2D }}</code>
+          </div>
+          <div class="pick-grid">
+            <div class="pick-item">
+              <span class="pick-label">级别</span>
+              <span class="pick-value">L{{ pickedGrid.level }}</span>
+            </div>
+            <div class="pick-item">
+              <span class="pick-label">索引</span>
+              <span class="pick-value">
+                {{ pickedGrid.indices.i }},{{ pickedGrid.indices.j }},{{ pickedGrid.indices.zi }}
+              </span>
+            </div>
+            <div class="pick-item pick-item--wide">
+              <span class="pick-label">中心点</span>
+              <span class="pick-value">
+                {{ fmtCoord(pickedGrid.center.lonDeg) }},
+                {{ fmtCoord(pickedGrid.center.latDeg) }},
+                {{ fmtHeight(pickedGrid.center.heightMeters) }}
+              </span>
+            </div>
+          </div>
+        </div>
+        <div v-else class="pick-empty">暂无拾取</div>
       </section>
 
       <!-- 需求②：级别 -->
@@ -442,6 +490,66 @@ onBeforeUnmount(() => offClick?.())
   font-weight: 700;
   color: #35f0c4;
   font-variant-numeric: tabular-nums;
+}
+
+.pick-readout {
+  display: grid;
+  gap: 9px;
+}
+.pick-code-row,
+.pick-empty,
+.pick-item {
+  border-radius: 8px;
+  background: rgba(53, 196, 255, 0.07);
+  border: 1px solid rgba(53, 196, 255, 0.14);
+}
+.pick-code-row {
+  padding: 8px 10px 9px;
+  min-width: 0;
+}
+.pick-code-row__label,
+.pick-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 11px;
+  color: #7fa9c7;
+}
+.pick-code {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  white-space: normal;
+  font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #eaf5ff;
+}
+.pick-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.pick-item {
+  min-width: 0;
+  padding: 8px 10px;
+}
+.pick-item--wide {
+  grid-column: 1 / -1;
+}
+.pick-value {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #d7e6f5;
+  font-variant-numeric: tabular-nums;
+}
+.pick-empty {
+  padding: 9px 10px;
+  font-size: 12px;
+  color: #7c93aa;
 }
 
 .switch-row {

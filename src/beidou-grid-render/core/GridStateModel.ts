@@ -77,6 +77,27 @@ interface SelectionEntry {
   category: number;
 }
 
+/** 可展示/外抛的单个实例格信息。 */
+export interface GridCellInfo {
+  /** 实例号。 */
+  instanceId: number;
+  /** 北斗网格级别。 */
+  level: number;
+  /** 实例在当前剖分中的索引。 */
+  indices: { i: number; j: number; zi: number };
+  /** 格中心点。 */
+  center: { lonDeg: number; latDeg: number; heightMeters: number };
+  /** 格边界。 */
+  bounds: {
+    westDeg: number;
+    southDeg: number;
+    eastDeg: number;
+    northDeg: number;
+    minHeightMeters: number;
+    maxHeightMeters: number;
+  };
+}
+
 /** 赤道每度米长（纬向恒定近似）。 */
 const METERS_PER_DEG_LAT = 111320.0;
 
@@ -331,6 +352,36 @@ export default class GridStateModel {
       lonDeg: ctx.originLonDeg + (i + 0.5) * ctx.stepLonDeg,
       latDeg: ctx.originLatDeg + (j + 0.5) * ctx.stepLatDeg,
       heightMeters: ctx.originHeightMeters + (zi + 0.5) * ctx.heightStepMeters,
+    };
+  }
+
+  /**
+   * 实例号 → 可展示的格信息（中心点 + 边界 + 当前级别）。
+   *
+   * @param id 实例号
+   * @returns 格信息；无上下文或越界返回 undefined
+   */
+  public getCellInfo(id: number): GridCellInfo | undefined {
+    const ctx = this.ctx;
+    if (!ctx || id < 0 || id >= this.count) return undefined;
+
+    const { i, j, zi } = this.indexToCell(id);
+    const center = this.cellCenter(i, j, zi);
+    const minHeightMeters = ctx.originHeightMeters + zi * ctx.heightStepMeters;
+
+    return {
+      instanceId: id,
+      level: ctx.level,
+      indices: { i, j, zi },
+      center,
+      bounds: {
+        westDeg: ctx.originLonDeg + i * ctx.stepLonDeg,
+        southDeg: ctx.originLatDeg + j * ctx.stepLatDeg,
+        eastDeg: ctx.originLonDeg + (i + 1) * ctx.stepLonDeg,
+        northDeg: ctx.originLatDeg + (j + 1) * ctx.stepLatDeg,
+        minHeightMeters,
+        maxHeightMeters: minHeightMeters + ctx.heightStepMeters,
+      },
     };
   }
 

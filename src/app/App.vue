@@ -2371,10 +2371,18 @@ onBeforeUnmount(() => {
 
 .tag {
   flex: none;
-  padding: 2px 7px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  height: 20px;
+  padding: 0 8px;
+  box-sizing: border-box;
   border-radius: 999px;
   font-size: 11px;
   font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
   color: #101419;
   background: #aab7c4;
 }
@@ -2396,8 +2404,16 @@ onBeforeUnmount(() => {
 
 .detail-head {
   display: flex;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+}
+.detail-head > div {
+  min-width: 0;
+  flex: 1;
+}
+.detail-head .tag {
+  margin-top: 2px;
 }
 .detail-head h2 {
   margin: 0;

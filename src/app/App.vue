@@ -65,6 +65,7 @@ const container = useTemplateRef<HTMLDivElement>('container')
 
 const activeScenario = ref<ScenarioFilter>('all')
 const activeModule = ref<ModuleId>('overview')
+const modulePanelOpen = ref<boolean>(false)
 const selectedMissionId = ref<string>(LOW_ALTITUDE_MISSIONS[0]!.id)
 const pickedGrid = ref<PickedGridInfo | undefined>(undefined)
 const isPlaying = ref<boolean>(true)
@@ -169,6 +170,13 @@ const moduleProfiles = {
 
 const activeModuleProfile = computed(() => moduleProfiles[activeModule.value])
 
+const overviewDutyBoard = [
+  { seat: '动态监控席', status: '在线', focus: '航迹融合、网格拾取、偏航告警' },
+  { seat: '运行协调席', status: '在线', focus: '跨场景任务冲突协调' },
+  { seat: '航空气象席', status: '关注', focus: '山区阵风、能见度、降雨窗口' },
+  { seat: '协助救援席', status: '待命', focus: '应急空域、救援航线、备降点' },
+]
+
 const serviceSeats = [
   '飞行计划席',
   '航空情报席',
@@ -205,6 +213,39 @@ const altitudeBands = [
   { label: '0-120m', name: '城市治理/植保', load: 76 },
   { label: '120-300m', name: '物流/巡检走廊', load: 64 },
   { label: '300-600m', name: '应急/UAM 验证', load: 42 },
+]
+
+const airspaceGridLedger = [
+  { name: '主城区精细监管网格', level: 'L5/L6', owner: '城市治理、物流配送', capacity: 82 },
+  { name: '机场净空保护网格', level: 'L4/L5', owner: '净空保护、飞行计划复核', capacity: 58 },
+  { name: '南部茶园作业网格', level: 'L5', owner: '农林植保、换电保障', capacity: 61 },
+  { name: '西北山区救援网格', level: 'L4', owner: '应急救援、气象监测', capacity: 44 },
+]
+
+const approvalChecklist = [
+  { item: '经营主体与操控员资质', owner: '飞行计划席', state: '已核验' },
+  { item: '实名登记与航空器识别', owner: '动态监控席', state: '已核验' },
+  { item: '任务性质、空域、日期、起降点', owner: '飞行计划席', state: '待复核' },
+  { item: '禁飞/限飞/临时管制冲突', owner: '航空情报席', state: '待复核' },
+  { item: '气象条件与备降预案', owner: '航空气象席', state: '关注' },
+  { item: '应急处置与动态监控联动', owner: '运行协调席', state: '已核验' },
+]
+
+const approvalDecisionRules = [
+  { title: '微轻小型无人机', detail: '适飞空域内按计划与动态监控要素校核。' },
+  { title: '管制空域飞行', detail: '需重点校核空域批准、时窗、起降点和运行隔离。' },
+  { title: '应急救援任务', detail: '允许临时空域协同，优先保障救援与医疗运输。' },
+]
+
+const industryScenarioCards = [
+  { scenario: 'logistics' as const, focus: '医疗冷链、即时配送', value: '时效网络', maturity: 78 },
+  { scenario: 'emergency' as const, focus: '搜救投送、灾情侦察', value: '公共安全', maturity: 62 },
+  { scenario: 'inspection' as const, focus: '电力、管线、道路巡检', value: '降本增效', maturity: 69 },
+  { scenario: 'urban-governance' as const, focus: '违建识别、交通治理', value: '城市精治', maturity: 74 },
+  { scenario: 'agriculture' as const, focus: '茶园植保、农情监测', value: '特色农业', maturity: 71 },
+  { scenario: 'tourism' as const, focus: '航拍观光、活动保障', value: '文旅消费', maturity: 56 },
+  { scenario: 'uam' as const, focus: 'eVTOL 接驳验证', value: '未来交通', maturity: 38 },
+  { scenario: 'surveying' as const, focus: '生态测绘、环保巡测', value: '绿色治理', maturity: 66 },
 ]
 
 let levelTimer: number | undefined
@@ -265,6 +306,20 @@ const operatorSummary = computed(() => {
   return { aircraft, online, pilots, sorties }
 })
 
+const averageCompliance = computed(() =>
+  (LOW_ALTITUDE_OPERATORS.reduce((sum, item) => sum + item.complianceRate, 0) / LOW_ALTITUDE_OPERATORS.length).toFixed(1),
+)
+
+const facilityAvailabilityRate = computed(() => {
+  const capacity = LOW_ALTITUDE_FACILITIES.reduce((sum, item) => sum + item.capacity, 0)
+  const available = LOW_ALTITUDE_FACILITIES.reduce((sum, item) => sum + item.available, 0)
+  return capacity > 0 ? Math.round((available / capacity) * 100) : 0
+})
+
+const operatorRanking = computed(() =>
+  [...LOW_ALTITUDE_OPERATORS].sort((a, b) => b.monthlySorties - a.monthlySorties),
+)
+
 const trendMax = computed(() =>
   Math.max(...FLIGHT_TRENDS.map((point) => Math.max(point.sorties, point.approvals, point.alerts * 10)), 1),
 )
@@ -284,6 +339,57 @@ const kpis = computed(() => {
     zones: AIRSPACE_ZONES.length,
     approvals: FLIGHT_PLAN_APPROVALS.filter((approval) => approval.status !== 'approved').length,
   }
+})
+
+const activeKpis = computed(() => {
+  const highRisks = RISK_EVENTS.filter((event) => event.level === 'high').length
+  const pendingApprovals = FLIGHT_PLAN_APPROVALS.filter((approval) => approval.status === 'pending').length
+  const recheckApprovals = FLIGHT_PLAN_APPROVALS.filter((approval) => approval.status === 'recheck').length
+  const approvedPlans = FLIGHT_PLAN_APPROVALS.filter((approval) => approval.status === 'approved').length
+  const noFlyZones = AIRSPACE_ZONES.filter((zone) => zone.type === 'no-fly' || zone.type === 'restricted').length
+  const corridorZones = AIRSPACE_ZONES.filter((zone) => zone.type === 'corridor').length
+
+  if (activeModule.value === 'airspace') {
+    return [
+      { label: '空域单元', value: AIRSPACE_ZONES.length },
+      { label: '航路走廊', value: corridorZones },
+      { label: '禁限飞区', value: noFlyZones, tone: 'warn' },
+      { label: '起降设施', value: LOW_ALTITUDE_FACILITIES.length },
+      { label: '设施可用', value: `${facilityAvailabilityRate.value}%` },
+      { label: '网格级别', value: `L${activeLevel.value}` },
+    ]
+  }
+
+  if (activeModule.value === 'approval') {
+    return [
+      { label: '待审批', value: pendingApprovals, tone: 'warn' },
+      { label: '需复核', value: recheckApprovals, tone: 'warn' },
+      { label: '已放行', value: approvedPlans },
+      { label: '高风险', value: highRisks, tone: 'warn' },
+      { label: '服务席位', value: serviceSeats.length },
+      { label: '平均耗时', value: '7.6m' },
+    ]
+  }
+
+  if (activeModule.value === 'industry') {
+    return [
+      { label: '月保障架次', value: operatorSummary.value.sorties },
+      { label: '运营主体', value: LOW_ALTITUDE_OPERATORS.length },
+      { label: '注册装备', value: operatorSummary.value.aircraft },
+      { label: '平均合规', value: `${averageCompliance.value}%` },
+      { label: '基础设施', value: LOW_ALTITUDE_FACILITIES.length },
+      { label: '服务收入', value: '31.8万' },
+    ]
+  }
+
+  return [
+    { label: '运行任务', value: kpis.value.running },
+    { label: '风险告警', value: kpis.value.warning, tone: 'warn' },
+    { label: '待飞计划', value: kpis.value.planned },
+    { label: '在线航空器', value: operatorSummary.value.online },
+    { label: '高风险点', value: highRisks, tone: 'warn' },
+    { label: '有效级别', value: `L${activeLevel.value}` },
+  ]
 })
 
 const scenarioStats = computed(() =>
@@ -482,6 +588,7 @@ watch(activeScenario, () => {
 })
 
 watch(activeModule, (module) => {
+  modulePanelOpen.value = false
   applyModulePreset(module)
 })
 
@@ -587,29 +694,9 @@ onBeforeUnmount(() => {
         </button>
       </nav>
       <div class="kpis">
-        <div class="kpi">
-          <span>运行任务</span>
-          <strong>{{ kpis.running }}</strong>
-        </div>
-        <div class="kpi kpi--warn">
-          <span>风险告警</span>
-          <strong>{{ kpis.warning }}</strong>
-        </div>
-        <div class="kpi">
-          <span>待飞计划</span>
-          <strong>{{ kpis.planned }}</strong>
-        </div>
-        <div class="kpi">
-          <span>空域单元</span>
-          <strong>{{ kpis.zones }}</strong>
-        </div>
-        <div class="kpi kpi--warn">
-          <span>待处理计划</span>
-          <strong>{{ kpis.approvals }}</strong>
-        </div>
-        <div class="kpi">
-          <span>有效级别</span>
-          <strong>L{{ activeLevel }}</strong>
+        <div v-for="item in activeKpis" :key="item.label" class="kpi" :class="{ 'kpi--warn': item.tone === 'warn' }">
+          <span>{{ item.label }}</span>
+          <strong>{{ item.value }}</strong>
         </div>
       </div>
     </header>
@@ -618,7 +705,154 @@ onBeforeUnmount(() => {
       <span>{{ activeModuleProfile.badge }}</span>
       <strong>{{ activeModuleProfile.title }}</strong>
       <em>{{ activeModuleProfile.subtitle }}</em>
+      <button type="button" class="module-panel-trigger" @click="modulePanelOpen = true">查看详情</button>
     </section>
+
+    <el-dialog
+      v-model="modulePanelOpen"
+      append-to-body
+      class="module-dialog"
+      width="72vw"
+      :close-on-click-modal="true"
+      :show-close="true"
+    >
+      <template #header>
+        <div class="module-dialog__head">
+          <span>{{ activeModuleProfile.badge }}</span>
+          <strong>{{ activeModuleProfile.title }}</strong>
+          <em>{{ activeModuleProfile.subtitle }}</em>
+        </div>
+      </template>
+      <section class="module-focus-content">
+      <template v-if="activeModule === 'overview'">
+        <div class="focus-head">
+          <span>运行值守</span>
+          <strong>实时飞行、风险、席位联动</strong>
+        </div>
+        <div class="overview-command-grid">
+          <div class="command-card command-card--primary">
+            <span>当前指挥对象</span>
+            <strong>{{ selectedMission?.name }}</strong>
+            <em>{{ selectedMission ? `${scenarioById(selectedMission.scenario).name} · ${selectedMission.operator}` : '暂无任务' }}</em>
+            <i v-if="selectedMission"><b :style="{ width: `${selectedMission.progress}%` }"></b></i>
+          </div>
+          <div class="seat-board">
+            <div v-for="seat in overviewDutyBoard" :key="seat.seat" class="seat-row">
+              <b :class="{ 'seat-row__state--warn': seat.status === '关注' }">{{ seat.status }}</b>
+              <span>
+                <strong>{{ seat.seat }}</strong>
+                <em>{{ seat.focus }}</em>
+              </span>
+            </div>
+          </div>
+          <div class="event-stream">
+            <div v-for="notice in OPERATION_NOTICES.slice(0, 3)" :key="notice.id" class="event-stream__item" :class="`notice--${notice.level}`">
+              <strong>{{ notice.time }}</strong>
+              <span>{{ notice.title }}</span>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <template v-else-if="activeModule === 'airspace'">
+        <div class="focus-head">
+          <span>空域资源</span>
+          <strong>分层、分类、分格管理</strong>
+        </div>
+        <div class="airspace-work-grid">
+          <div class="airspace-profile">
+            <div v-for="band in altitudeBands" :key="band.label" class="airspace-lane">
+              <span>
+                <strong>{{ band.label }}</strong>
+                <em>{{ band.name }}</em>
+              </span>
+              <i><b :style="{ width: `${band.load}%` }"></b></i>
+              <small>{{ band.load }}%</small>
+            </div>
+          </div>
+          <div class="grid-ledger">
+            <div v-for="item in airspaceGridLedger" :key="item.name" class="ledger-row">
+              <span>
+                <strong>{{ item.name }}</strong>
+                <em>{{ item.level }} · {{ item.owner }}</em>
+              </span>
+              <b>{{ item.capacity }}%</b>
+            </div>
+          </div>
+          <div class="airspace-policy">
+            <div v-for="rule in airspaceRuleCards" :key="rule.title" class="policy-pill">
+              <strong>{{ rule.title }}</strong>
+              <span>{{ rule.detail }}</span>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <template v-else-if="activeModule === 'approval'">
+        <div class="focus-head">
+          <span>审批工单</span>
+          <strong>申请要素、规则校核、席位放行</strong>
+        </div>
+        <div class="approval-work-grid">
+          <div class="approval-case-card">
+            <span>当前复核计划</span>
+            <strong>{{ approvalQueue[0]?.routeName ?? '暂无计划' }}</strong>
+            <em>{{ approvalQueue[0]?.applicant }} · {{ approvalQueue[0]?.window }}</em>
+            <i v-if="approvalQueue[0]"><b :style="{ width: `${approvalQueue[0].riskScore}%` }"></b></i>
+          </div>
+          <div class="compliance-list">
+            <div v-for="check in approvalChecklist" :key="check.item" class="compliance-row">
+              <b :class="{ 'compliance-row__state--warn': check.state !== '已核验' }">{{ check.state }}</b>
+              <span>
+                <strong>{{ check.item }}</strong>
+                <em>{{ check.owner }}</em>
+              </span>
+            </div>
+          </div>
+          <div class="decision-rules">
+            <div v-for="rule in approvalDecisionRules" :key="rule.title" class="decision-rule">
+              <strong>{{ rule.title }}</strong>
+              <span>{{ rule.detail }}</span>
+            </div>
+          </div>
+        </div>
+      </template>
+
+      <template v-else>
+        <div class="focus-head">
+          <span>产业画像</span>
+          <strong>场景价值、主体能力、设施覆盖</strong>
+        </div>
+        <div class="industry-work-grid">
+          <div class="scenario-portfolio">
+            <div v-for="item in industryScenarioCards" :key="item.scenario" class="portfolio-row">
+              <span>
+                <strong>{{ scenarioById(item.scenario).shortName }}</strong>
+                <em>{{ item.focus }} · {{ item.value }}</em>
+              </span>
+              <i><b :style="{ width: `${item.maturity}%`, background: scenarioById(item.scenario).color }"></b></i>
+              <small>{{ item.maturity }}</small>
+            </div>
+          </div>
+          <div class="operator-rank">
+            <div v-for="operator in operatorRanking.slice(0, 4)" :key="operator.id" class="rank-row">
+              <span>
+                <strong>{{ operator.name }}</strong>
+                <em>{{ operatorTypeLabel(operator.type) }} · 合规 {{ operator.complianceRate }}%</em>
+              </span>
+              <b>{{ operator.monthlySorties }}</b>
+            </div>
+          </div>
+          <div class="facility-mosaic">
+            <div v-for="facility in LOW_ALTITUDE_FACILITIES" :key="facility.id" class="facility-chip">
+              <strong>{{ facilityTypeLabel(facility.type) }}</strong>
+              <span>{{ facility.available }}/{{ facility.capacity }}</span>
+            </div>
+          </div>
+        </div>
+      </template>
+      </section>
+    </el-dialog>
 
     <aside class="left-rail panel-shell">
       <template v-if="activeModule === 'overview'">
@@ -1378,7 +1612,7 @@ onBeforeUnmount(() => {
   right: 398px;
   min-height: 44px;
   display: grid;
-  grid-template-columns: max-content max-content minmax(0, 1fr);
+  grid-template-columns: max-content max-content minmax(0, 1fr) max-content;
   align-items: center;
   gap: 10px;
   padding: 9px 12px;
@@ -1404,6 +1638,351 @@ onBeforeUnmount(() => {
   white-space: nowrap;
   font-style: normal;
   font-size: 12px;
+}
+.module-panel-trigger {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid rgba(var(--accent-rgb), 0.38);
+  border-radius: 6px;
+  background: rgba(var(--accent-rgb), 0.14);
+  color: #f2fbff;
+  font-size: 12px;
+  font-weight: 800;
+  cursor: pointer;
+}
+.module-panel-trigger:hover {
+  background: rgba(var(--accent-rgb), 0.24);
+}
+:deep(.module-dialog) {
+  border: 1px solid rgba(var(--accent-rgb), 0.26);
+  border-radius: 8px;
+  background: rgba(12, 18, 24, 0.94);
+  box-shadow: 0 28px 72px rgba(0, 0, 0, 0.52);
+}
+:deep(.module-dialog .el-dialog__header) {
+  margin: 0;
+  padding: 16px 18px 10px;
+}
+:deep(.module-dialog .el-dialog__body) {
+  padding: 0 18px 18px;
+}
+:deep(.module-dialog .el-dialog__headerbtn .el-dialog__close) {
+  color: #d7e6f5;
+}
+.module-dialog__head {
+  display: grid;
+  grid-template-columns: max-content max-content minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding-right: 34px;
+}
+.module-dialog__head span {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.18);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+}
+.module-dialog__head strong {
+  color: #f8fbff;
+  font-size: 15px;
+}
+.module-dialog__head em {
+  min-width: 0;
+  overflow: hidden;
+  color: #98aabb;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: normal;
+  font-size: 12px;
+}
+.module-focus-content {
+  height: min(58vh, 560px);
+  min-height: 360px;
+}
+.focus-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.focus-head span {
+  padding: 4px 8px;
+  border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.16);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 800;
+}
+.focus-head strong {
+  min-width: 0;
+  overflow: hidden;
+  color: #f6fbff;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+}
+.overview-command-grid,
+.airspace-work-grid,
+.approval-work-grid,
+.industry-work-grid {
+  min-height: 0;
+  height: calc(100% - 36px);
+  display: grid;
+  grid-template-columns: 1.1fr 1.2fr 1fr;
+  gap: 10px;
+}
+.command-card,
+.seat-board,
+.event-stream,
+.airspace-profile,
+.grid-ledger,
+.airspace-policy,
+.approval-case-card,
+.compliance-list,
+.decision-rules,
+.scenario-portfolio,
+.operator-rank,
+.facility-mosaic {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.052);
+  border: 1px solid rgba(255, 255, 255, 0.075);
+}
+.command-card,
+.approval-case-card {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 14px;
+}
+.command-card span,
+.approval-case-card span {
+  color: #91a0ad;
+  font-size: 11px;
+}
+.command-card strong,
+.approval-case-card strong {
+  display: block;
+  margin-top: 8px;
+  color: #ffffff;
+  font-size: 18px;
+  line-height: 1.25;
+}
+.command-card em,
+.approval-case-card em {
+  display: block;
+  margin-top: 8px;
+  color: #9fafbd;
+  font-style: normal;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.command-card i,
+.approval-case-card i,
+.portfolio-row i,
+.airspace-lane i {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+}
+.command-card i,
+.approval-case-card i {
+  margin-top: 16px;
+}
+.command-card b,
+.approval-case-card b,
+.portfolio-row b,
+.airspace-lane b {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+}
+.seat-board,
+.event-stream,
+.grid-ledger,
+.airspace-policy,
+.compliance-list,
+.decision-rules,
+.scenario-portfolio,
+.operator-rank {
+  overflow-y: auto;
+  padding: 10px;
+}
+.seat-row,
+.compliance-row,
+.ledger-row,
+.rank-row {
+  display: grid;
+  grid-template-columns: 54px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+.ledger-row,
+.rank-row {
+  grid-template-columns: minmax(0, 1fr) 48px;
+}
+.seat-row:last-child,
+.compliance-row:last-child,
+.ledger-row:last-child,
+.rank-row:last-child {
+  border-bottom: none;
+}
+.seat-row b,
+.compliance-row b {
+  padding: 3px 6px;
+  border-radius: 999px;
+  background: rgba(var(--accent-rgb), 0.18);
+  color: var(--accent);
+  text-align: center;
+  font-size: 10px;
+}
+.seat-row__state--warn,
+.compliance-row__state--warn {
+  background: rgba(255, 149, 0, 0.18) !important;
+  color: #ffd49a !important;
+}
+.seat-row strong,
+.compliance-row strong,
+.ledger-row strong,
+.rank-row strong {
+  display: block;
+  color: #f6fbff;
+  font-size: 12px;
+}
+.seat-row em,
+.compliance-row em,
+.ledger-row em,
+.rank-row em {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: #8e9ead;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: normal;
+  font-size: 11px;
+}
+.event-stream__item {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr);
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+.event-stream__item:last-child {
+  border-bottom: none;
+}
+.event-stream__item strong {
+  color: var(--accent);
+  font-size: 12px;
+}
+.event-stream__item span {
+  color: #d8e2ec;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.airspace-profile {
+  display: grid;
+  align-content: stretch;
+  gap: 8px;
+  padding: 10px;
+}
+.airspace-lane,
+.portfolio-row {
+  display: grid;
+  grid-template-columns: minmax(104px, 1fr) minmax(0, 1.2fr) 32px;
+  align-items: center;
+  gap: 8px;
+}
+.airspace-lane {
+  min-height: 46px;
+}
+.airspace-lane strong,
+.portfolio-row strong {
+  display: block;
+  color: #f6fbff;
+  font-size: 12px;
+}
+.airspace-lane em,
+.portfolio-row em {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  color: #8e9ead;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: normal;
+  font-size: 11px;
+}
+.airspace-lane small,
+.portfolio-row small {
+  color: #b8c5d2;
+  text-align: right;
+  font-size: 11px;
+}
+.ledger-row b,
+.rank-row b {
+  color: var(--accent);
+  text-align: right;
+  font-size: 13px;
+}
+.policy-pill,
+.decision-rule {
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+}
+.policy-pill:last-child,
+.decision-rule:last-child {
+  border-bottom: none;
+}
+.policy-pill strong,
+.decision-rule strong {
+  display: block;
+  color: #f6fbff;
+  font-size: 12px;
+}
+.policy-pill span,
+.decision-rule span {
+  display: block;
+  margin-top: 4px;
+  color: #8e9ead;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.facility-mosaic {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  padding: 10px;
+}
+.facility-chip {
+  min-width: 0;
+  display: grid;
+  place-content: center;
+  gap: 4px;
+  border-radius: 6px;
+  background: rgba(var(--accent-rgb), 0.1);
+}
+.facility-chip strong,
+.facility-chip span {
+  text-align: center;
+}
+.facility-chip strong {
+  color: #f6fbff;
+  font-size: 12px;
+}
+.facility-chip span {
+  color: var(--accent);
+  font-size: 16px;
+  font-weight: 800;
 }
 
 .left-rail,

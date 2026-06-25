@@ -1,252 +1,268 @@
-/**
- * 应用层：创建 Viewer + 北斗渲染场景，暴露公开 API（init / 渲染 / 占用着色 / 拾取 / 基准 / 清理）。
- *
- * 渲染走 `beidou-grid-render` 的 GPU 实例化满填充（单 draw call、位置 GPU 派生、1 字节/格），
- * 替换了原「逐格 viewer.entities.add + 2 万格上限」的卡顿实现——现在百万~千万格也流畅。
- */
+// ============================================================
+// app/index.ts — 应用层入口（重设计：立方体场渲染路径）
+// 职责：① 创建/销毁 Cesium Viewer；② 构造 BeiDouFieldScene 渲染编排器；
+//       ③ 暴露面向三需求的 Demo API：
+//          需求① 渲染模式(线框/填充) / 填充透明度 / 清除选中；
+//          需求② 级别锁定(自动/1-10) / 取当前生效级别；
+//          需求③ 无人机起飞·降落 / 高度 / 影响半径 / 速度；
+//       ④ 可选加载普洱市行政边界（贴地折线，独立于立方体场）。
+// 说明：边界加载器直接挂在 app 层（持有 viewer），保持编排器聚焦三需求。
+// ============================================================
 import * as Cesium from 'cesium'
+
 import {
-  BeiDouGridScene,
-  cellStepDeg,
-  type BeiDouGridConfig,
-  type GridDims,
-  type OccupancyColoring,
-  type OccupancyProvider,
-  type PickedCell,
+  BeiDouFieldScene,
+  type BeiDouFieldConfig,
+  type FieldMode,
+  type HeightRange,
+  GeoJsonBoundaryLoader,
+  type BoundaryLoadResult,
+  type BoundaryStyle,
 } from '../beidou-grid-render'
 
+/** 普洱市行政边界（GeoJSON，DataV 阿里云）。 */
+export const PUER_BOUNDARY_URL = 'https://geo.datav.aliyun.com/areas_v3/bound/530800.json'
+
+/** 普洱市中心（思茅区附近），作为默认定位与无人机巡航中心。 */
+export const PUER_CENTER = { lon: 100.972, lat: 22.778 } as const
+
 let viewer: Cesium.Viewer | undefined
-let gridScene: BeiDouGridScene | undefined
-let demoPickHandler: Cesium.ScreenSpaceEventHandler | undefined
+let fieldScene: BeiDouFieldScene | undefined
+let boundaryLoader: GeoJsonBoundaryLoader | undefined
 
-type GridBounds = { west: number; south: number; east: number; north: number }
-
-export type GridCreateResult = {
-  status: 'rendered' | 'skipped'
-  message: string
-  columns: number
-  rows: number
-  heightLayers: number
-  gridCount: number
-  entityCount: number
-  labelsRendered: number
-  stepLon: number
-  stepLat: number
-}
-
-const formatCount = (count: number): string =>
-  Number.isFinite(count) ? Math.round(count).toLocaleString('zh-CN') : 'infinity'
-
-const normalizeBounds = (bbox: GridBounds): GridBounds => ({
-  west: Math.min(Number(bbox.west), Number(bbox.east)),
-  south: Math.min(Number(bbox.south), Number(bbox.north)),
-  east: Math.max(Number(bbox.west), Number(bbox.east)),
-  north: Math.max(Number(bbox.south), Number(bbox.north)),
-})
-
-const planesOf = (maxHeight: number, stepHeight: number): number =>
-  stepHeight > 0 ? Math.max(1, Math.ceil(Number(maxHeight) / Number(stepHeight))) : 1
-
-/** 估算格规模（不再有「超限跳过」——GPU 实例化可流畅渲染百万~千万格）。 */
-export const estimateGridLoad = (
-  stepHeight: number,
-  gridSize: number,
-  maxHeight: number,
-  bbox: GridBounds,
-): GridCreateResult => {
-  const bounds = normalizeBounds(bbox)
-  const [stepLon, stepLat] = cellStepDeg(Number(gridSize))
-  const width = Math.max(0, bounds.east - bounds.west)
-  const height = Math.max(0, bounds.north - bounds.south)
-  const columns = Math.ceil(width / stepLon) + 1
-  const rows = Math.ceil(height / stepLat) + 1
-  const heightLayers = planesOf(maxHeight, stepHeight)
-  const gridCount = columns * rows * heightLayers
-
-  return {
-    status: 'rendered',
-    message: `Estimated ${formatCount(gridCount)} 北斗网格。`,
-    columns,
-    rows,
-    heightLayers,
-    gridCount,
-    entityCount: gridCount,
-    labelsRendered: 0,
-    stepLon,
-    stepLat,
-  }
-}
-
-/** 创建 Viewer + 北斗渲染场景。 */
-export const init = (element: HTMLDivElement, config?: BeiDouGridConfig): Cesium.Viewer => {
+/**
+ * 初始化 Viewer 并创建北斗立方体场渲染编排器。
+ *
+ * @param element 容器 DOM
+ * @param config  渲染配置（可选）
+ * @returns       Cesium.Viewer
+ */
+export const init = (element: HTMLDivElement, config?: BeiDouFieldConfig): Cesium.Viewer => {
   viewer = new Cesium.Viewer(element, {
     geocoder: false,
     homeButton: false,
     sceneModePicker: false,
     baseLayerPicker: false,
     navigationHelpButton: false,
-    animation: true,
-    timeline: true,
+    animation: false,
+    timeline: false,
     fullscreenButton: false,
     vrButton: false,
     scene3DOnly: true,
     infoBox: false,
+    selectionIndicator: false,
     shouldAnimate: true,
-    // GPU 引擎依赖 WebGL2（gl_InstanceID / in-out / dFdx）；Cesium 1.133 默认即用 WebGL2
-    // （仅在显式 contextOptions.requestWebgl1 时才回退 WebGL1），故无需额外声明。
   })
 
+  // 关键：开启地形深度测试。默认 false 时 Cesium 会在画主体前清空地形深度，
+  // 任何 primitive 都"穿透"地形显示；开启后地形保留深度，埋在地表下的立方体被
+  // 正确遮挡——这是立方体场"贴地"（底部被地形裁掉、只露出地表以上部分）的基础。
+  viewer.scene.globe.depthTestAgainstTerrain = true
+
+  // 异步加载世界地形（立方体场底面贴近真实地表观感更好）。
   Cesium.createWorldTerrainAsync()
     .then((terrainProvider) => {
-      if (viewer && !viewer.isDestroyed()) viewer.terrainProvider = terrainProvider
+      if (viewer && !viewer.isDestroyed()) {
+        viewer.terrainProvider = terrainProvider
+        // 世界地形就位后触发一次重建，重采样地形高把静态网格贴到真实地表
+        // （静态网格不再随相机移动重建，故此处需显式纠正一次贴地）。
+        fieldScene?.refresh()
+      }
     })
     .catch(() => {
-      /* 无地形时仍可渲染（椭球面） */
+      /* 地形加载失败时退回椭球面，不影响立方体场渲染。 */
     })
 
-  gridScene = new BeiDouGridScene(viewer.scene, {
-    heightRange: { min: 0, max: 20000, step: 0 },
-    labelUse3D: false,
-    enableLines: true,
-    enableLabels: false,
-    enableInstancedFill: true, // 开启满填充（默认引擎 'gpu'）；无占用数据时不绘制，开销可忽略
-    fillEngine: 'gpu',
+  // 立方体场渲染编排器（构造传 viewer，内部用 viewer.scene 渲染、viewer.entities 承载无人机）。
+  // 静态网格锚点默认普洱城区（= 相机定位中心 / 无人机巡航中心），网格固定贴在此处，
+  // 不随相机倾斜/远近/平移重算；调用方可在 config 里覆盖。
+  fieldScene = new BeiDouFieldScene(viewer, {
     ...config,
+    anchorLonDeg: config?.anchorLonDeg ?? PUER_CENTER.lon,
+    anchorLatDeg: config?.anchorLatDeg ?? PUER_CENTER.lat,
   })
+
+  // 边界加载器（独立图层，挂在场景 primitives 上）。
+  boundaryLoader = new GeoJsonBoundaryLoader(viewer.scene.primitives)
+
+  // 默认飞向普洱市，便于直接观察。
+  flyToPoint(PUER_CENTER.lon, PUER_CENTER.lat, 0, 6000, 0)
 
   return viewer
 }
 
-const flyToBounds = (bounds: GridBounds): void => {
-  if (!viewer) return
+// ──────────────────────────────────────────────
+// 需求①：渲染模式 / 填充 / 选中
+// ──────────────────────────────────────────────
+
+/** 设渲染模式（线框/填充）。默认线框。 */
+export const setMode = (mode: FieldMode): void => {
+  fieldScene?.setMode(mode)
+}
+
+/** 取当前渲染模式。 */
+export const getMode = (): FieldMode => fieldScene?.getMode() ?? 'wire'
+
+/** 设填充模式全局不透明度（0..1）。 */
+export const setFillOpacity = (opacity: number): void => {
+  fieldScene?.setFillOpacity(opacity)
+}
+
+/** 清空全部点击选中。 */
+export const clearSelections = (): void => {
+  fieldScene?.clearSelections()
+}
+
+// ──────────────────────────────────────────────
+// 需求②：级别
+// ──────────────────────────────────────────────
+
+/** 锁定/恢复显示级别（undefined = 自动按比例尺）。 */
+export const setLevelOverride = (level?: number): void => {
+  fieldScene?.setLevelOverride(level)
+}
+
+/** 取当前生效的显示级别。 */
+export const getActiveLevel = (): number => fieldScene?.getActiveLevel() ?? 1
+
+/** 设给定范围（约束区域）。任一参数非有限值则取消约束。 */
+export const setGivenRange = (west: number, south: number, east: number, north: number): void => {
+  if (!fieldScene) return
+  if (![west, south, east, north].every(Number.isFinite)) {
+    fieldScene.clearGivenRange()
+    return
+  }
+  fieldScene.setGivenRange(Cesium.Rectangle.fromDegrees(west, south, east, north))
+}
+
+/** 取消给定范围（仅用可视范围）。 */
+export const clearGivenRange = (): void => {
+  fieldScene?.clearGivenRange()
+}
+
+// ──────────────────────────────────────────────
+// 需求③：无人机
+// ──────────────────────────────────────────────
+
+/** 无人机起飞（不传中心则用视图/给定范围中心）。 */
+export const startDrone = (centerLon?: number, centerLat?: number): void => {
+  fieldScene?.startDrone(centerLon, centerLat)
+}
+
+/** 无人机降落（停飞 + 清影响）。 */
+export const stopDrone = (): void => {
+  fieldScene?.stopDrone()
+}
+
+/** 无人机是否在飞行。 */
+export const isDroneRunning = (): boolean => fieldScene?.isDroneRunning() ?? false
+
+/** 设无人机巡航大地高（米）。 */
+export const setDroneAltitude = (meters: number): void => {
+  fieldScene?.setDroneAltitude(meters)
+}
+
+/** 设无人机影响半径（米）。 */
+export const setDroneInfluenceRadius = (meters: number): void => {
+  fieldScene?.setDroneInfluenceRadius(meters)
+}
+
+/** 设无人机角速度（弧度/秒）。 */
+export const setDroneSpeed = (radPerSec: number): void => {
+  fieldScene?.setDroneSpeed(radPerSec)
+}
+
+/** 设无人机巡航圆半径（米）。 */
+export const setDroneOrbitRadius = (meters: number): void => {
+  fieldScene?.setDroneOrbitRadius(meters)
+}
+
+// ──────────────────────────────────────────────
+// 边界 / 相机 / 生命周期
+// ──────────────────────────────────────────────
+
+/**
+ * 加载行政区/区域 GeoJSON 边界（贴地折线 Primitive），可选飞到其 bbox。
+ *
+ * @param url     GeoJSON 资源 URL（如 PUER_BOUNDARY_URL）
+ * @param options 外观与是否飞行到 bbox
+ * @returns       加载结果摘要（含 ring 数与 bounds）
+ */
+export const loadBoundary = async (
+  url: string,
+  options?: { style?: Partial<BoundaryStyle>; flyTo?: boolean },
+): Promise<BoundaryLoadResult | undefined> => {
+  if (!boundaryLoader) return undefined
+  const resolved: BoundaryStyle = {
+    color: options?.style?.color ?? Cesium.Color.fromCssColorString('#35c4ff').withAlpha(0.95),
+    width: options?.style?.width ?? 3,
+  }
+  const result = await boundaryLoader.loadFromUrl(url, resolved)
+  if (options?.flyTo && result.bounds && viewer && !viewer.isDestroyed()) {
+    viewer.camera.flyTo({ destination: result.bounds, duration: 1.2 })
+  }
+  return result
+}
+
+/** 设边界图层可见性。 */
+export const setBoundaryVisible = (visible: boolean): void => {
+  boundaryLoader?.setVisible(visible)
+}
+
+/** 清空边界图层。 */
+export const clearBoundary = (): void => {
+  boundaryLoader?.clear()
+}
+
+/** 强制重建一次。 */
+export const refreshAll = (): void => {
+  fieldScene?.refresh()
+}
+
+/** 调试：取编排器实例。 */
+export const getFieldScene = (): BeiDouFieldScene | undefined => fieldScene
+
+/** 调试：取 Viewer。 */
+export const getViewer = (): Cesium.Viewer | undefined => viewer
+
+/**
+ * 飞行相机到经纬高度点（俯视）。
+ *
+ * @param lon        经度（度）
+ * @param lat        纬度（度）
+ * @param targetH    目标大地高（米）
+ * @param viewHeight 相机相对目标视距（米）
+ * @param duration   飞行时长（秒）
+ */
+export const flyToPoint = (
+  lon: number,
+  lat: number,
+  targetH = 0,
+  viewHeight = 4000,
+  duration = 1.0,
+): void => {
+  if (!viewer || viewer.isDestroyed()) return
   viewer.camera.flyTo({
-    destination: Cesium.Rectangle.fromDegrees(bounds.west, bounds.south, bounds.east, bounds.north),
-    duration: 1.0,
+    destination: Cesium.Cartesian3.fromDegrees(lon, lat, targetH + viewHeight),
+    orientation: {
+      heading: 0,
+      pitch: Cesium.Math.toRadians(-55),
+      roll: 0,
+    },
+    duration,
   })
 }
 
-/**
- * 渲染北斗网格（驱动场景）：设定高度范围、锁定级别、给定范围、开启占用演示并飞向区域。
- * 保留与原 UI 的调用契约；返回规模摘要（不再有 2 万格上限）。
- */
-export const createGrid = (
-  stepHeight: number,
-  gridSize: number,
-  maxHeight: number,
-  bbox: GridBounds,
-): GridCreateResult => {
-  if (!gridScene || !viewer) {
-    throw new Error('createGrid: 请先调用 init()。')
-  }
-  const bounds = normalizeBounds(bbox)
-  const estimate = estimateGridLoad(stepHeight, gridSize, maxHeight, bounds)
-
-  gridScene.setHeightRange({ min: 0, max: Number(maxHeight), step: Number(stepHeight) })
-  gridScene.setLevelOverride(Number(gridSize))
-  gridScene.setGivenRange(bounds)
-  enableOccupancyDemo()
-  flyToBounds(bounds)
-
-  return {
-    ...estimate,
-    message: `渲染 ${formatCount(estimate.gridCount)} 北斗网格（GPU 实例化 · 单 draw call · ${estimate.heightLayers} 高度层）。`,
-  }
-}
-
-// ───────────────────────── 占用着色 ─────────────────────────
-
-/** 演示调色板：0 透明、1 青、2 橙、3 品红。 */
-const DEMO_PALETTE = ((): Uint8Array => {
-  const p = new Uint8Array(256 * 4)
-  p.set([0, 224, 224, 220], 1 * 4)
-  p.set([255, 150, 40, 220], 2 * 4)
-  p.set([230, 60, 200, 220], 3 * 4)
-  return p
-})()
-
-export const setOccupancy = (coloring: OccupancyColoring): void => gridScene?.setOccupancy(coloring)
-
-export const setOccupancyProvider = (provider?: OccupancyProvider): void =>
-  gridScene?.setOccupancyProvider(provider)
-
-/** 一键演示「大数据量不卡顿」：按当前维度即时生成同心环 + 高度配色的体素。 */
-export const enableOccupancyDemo = (fillRatio = 0.6): void => {
-  if (!gridScene) return
-  const bands = Math.min(12, Math.max(2, Math.round(6 / Math.max(0.1, fillRatio))))
-  const provider: OccupancyProvider = ({ nx, ny, planes }: GridDims): OccupancyColoring => {
-    const total = nx * ny * planes
-    const categories = new Uint8Array(total)
-    const cxf = (nx - 1) / 2
-    const cyf = (ny - 1) / 2
-    const maxR = Math.max(1, Math.hypot(cxf, cyf))
-    for (let zi = 0; zi < planes; zi++) {
-      for (let j = 0; j < ny; j++) {
-        const rowBase = (zi * ny + j) * nx
-        const dy = j - cyf
-        for (let i = 0; i < nx; i++) {
-          const dx = i - cxf
-          const r = Math.hypot(dx, dy) / maxR
-          const band = Math.floor(r * bands)
-          categories[rowBase + i] = band % 2 === 0 ? 1 + ((zi + (band >> 1)) % 3) : 0
-        }
-      }
-    }
-    return { categories, palette: DEMO_PALETTE }
-  }
-  gridScene.setOccupancyProvider(provider)
-}
-
-export const disableOccupancyDemo = (): void => gridScene?.setOccupancyProvider(undefined)
-
-// ───────────────────────── 拾取 ─────────────────────────
-
-export const pickGridCellAt = (x: number, y: number, use3D?: boolean): PickedCell | undefined =>
-  gridScene?.pickCellAt(new Cesium.Cartesian2(x, y), use3D)
-
-/** 左键点击回调，返回解绑函数。 */
-export const onCellClick = (
-  cb: (cell: PickedCell | undefined) => void,
-  use3D?: boolean,
-): (() => void) => {
-  if (!viewer || viewer.isDestroyed()) return () => {}
-  demoPickHandler?.destroy()
-  const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas)
-  handler.setInputAction((movement: Cesium.ScreenSpaceEventHandler.PositionedEvent) => {
-    cb(gridScene?.pickCellAt(movement.position, use3D))
-  }, Cesium.ScreenSpaceEventType.LEFT_CLICK)
-  demoPickHandler = handler
-  return () => {
-    if (demoPickHandler === handler) demoPickHandler = undefined
-    if (!handler.isDestroyed()) handler.destroy()
-  }
-}
-
-// ───────────────────────── 其它 ─────────────────────────
-
-export const setGivenRange = (bbox: GridBounds): void =>
-  gridScene?.setGivenRange(normalizeBounds(bbox))
-export const clearGivenRange = (): void => gridScene?.clearGivenRange()
-export const setLevelOverride = (level?: number): void => gridScene?.setLevelOverride(level)
-export const getActiveLevel = (): number | undefined => gridScene?.getActiveLevel()
-export const setFillOpacity = (opacity: number): void => gridScene?.setFillOpacity(opacity)
-export const refreshAll = (): void => gridScene?.refresh()
-
-export const flyToPoint = (lon: number, lat: number, height = 0, range = 60000): void => {
-  if (!viewer) return
-  viewer.camera.flyToBoundingSphere(
-    new Cesium.BoundingSphere(Cesium.Cartesian3.fromDegrees(lon, lat, height), range),
-    { duration: 1.0 },
-  )
-}
-
-export const getGridScene = (): BeiDouGridScene | undefined => gridScene
-export const getViewer = (): Cesium.Viewer | undefined => viewer
-
+/** 销毁：释放渲染层 + Viewer。 */
 export const dispose = (): void => {
-  demoPickHandler?.destroy()
-  demoPickHandler = undefined
-  gridScene?.dispose()
-  gridScene = undefined
-  if (viewer && !viewer.isDestroyed()) viewer.destroy()
+  fieldScene?.dispose()
+  fieldScene = undefined
+  boundaryLoader?.destroy()
+  boundaryLoader = undefined
+  if (viewer && !viewer.isDestroyed()) {
+    viewer.destroy()
+  }
   viewer = undefined
 }
+
+export type { BeiDouFieldConfig, FieldMode, HeightRange, BoundaryLoadResult, BoundaryStyle }

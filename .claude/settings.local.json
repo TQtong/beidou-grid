@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls \"C:/Users/tqton/Downloads/files.zip\" && ls \"G:/myself/project/web/beidou-grid\")",
+      "Bash(unzip -o files.zip -d files_extracted/)",
+      "Bash(npx vue-tsc *)"
+    ]
+  }
+}

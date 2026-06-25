@@ -49,7 +49,7 @@ import {
   RENDER_FRAGMENT_SHADER,
   RENDER_VERTEX_SHADER,
 } from './GridFieldShaders';
-import GridStateModel, { type GridCellInfo } from './GridStateModel';
+import GridStateModel, { type GridCellInfo, type GridOverlayInput } from './GridStateModel';
 import InstancePicker from './InstancePicker';
 import type { Tessellation } from '../grid/GridTessellator';
 import { pointToCode2D, pointToCode3D } from '../geo-bridge';
@@ -67,6 +67,8 @@ export interface PickedGridInfo extends GridCellInfo {
   /** 三维北斗网格编码。 */
   code3D: string;
 }
+
+export type { GridOverlayInput };
 
 /** 赤道每度米长（纬向恒定近似，经向再乘 cos(lat)）。 */
 const METERS_PER_DEG = 111320.0;
@@ -159,6 +161,8 @@ export default class GridCubeField {
   private fillOpacity = 1.0;
   /** 显示开关。 */
   private show = true;
+  /** 当前业务叠加网格着色输入。 */
+  private gridOverlays: GridOverlayInput[] = [];
 
   // ── 拾取 ──
   /** CPU 端自算的拾取投影矩阵（proj·view·model）。 */
@@ -244,6 +248,7 @@ export default class GridCubeField {
 
     this.texW = this.state.getTexWidth();
     this.texH = this.state.getTexHeight();
+    this.state.setGridOverlays(this.gridOverlays);
     if (sizeChanged) this.texSizeDirty = true;
     this.stateDirty = true;
   }
@@ -301,6 +306,22 @@ export default class GridCubeField {
   public clearSelections(): void {
     if (this.destroyed) return;
     this.state.clearSelections();
+    this.stateDirty = true;
+  }
+
+  /** 设置业务叠加网格着色（航路/禁限飞/风险等）。 */
+  public setGridOverlays(overlays: readonly GridOverlayInput[]): void {
+    if (this.destroyed) return;
+    this.gridOverlays = overlays.map((overlay) => ({ ...overlay }));
+    this.state.setGridOverlays(this.gridOverlays);
+    this.stateDirty = true;
+  }
+
+  /** 清空业务叠加网格着色。 */
+  public clearGridOverlays(): void {
+    if (this.destroyed) return;
+    this.gridOverlays = [];
+    this.state.clearGridOverlays();
     this.stateDirty = true;
   }
 

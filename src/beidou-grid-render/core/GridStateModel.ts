@@ -25,6 +25,20 @@ export const Category = {
   SELECT_B: 11,
   /** 用户选中色 C（品红）。 */
   SELECT_C: 12,
+  /** 低空航路 / 任务航线覆盖格。 */
+  ROUTE: 20,
+  /** 低空航路走廊覆盖格。 */
+  CORRIDOR: 21,
+  /** 限飞协调区覆盖格。 */
+  RESTRICTED: 22,
+  /** 禁飞 / 净空保护区覆盖格。 */
+  NO_FLY: 23,
+  /** 中等级风险覆盖格。 */
+  RISK_MEDIUM: 24,
+  /** 高等级风险覆盖格。 */
+  RISK_HIGH: 25,
+  /** 应急临时空域覆盖格。 */
+  EMERGENCY: 26,
 } as const;
 
 /** 选中态点击循环顺序：空 → A → B → C → 空。 */
@@ -98,6 +112,35 @@ export interface GridCellInfo {
   };
 }
 
+/** 业务叠加图层在北斗网格上的着色类型。 */
+export type GridOverlayKind =
+  | 'route'
+  | 'corridor'
+  | 'restricted'
+  | 'no-fly'
+  | 'risk-medium'
+  | 'risk-high'
+  | 'emergency';
+
+/** 业务点/线/区域采样后的网格着色输入。 */
+export interface GridOverlayInput {
+  lonDeg: number;
+  latDeg: number;
+  heightMeters: number;
+  radiusMeters: number;
+  kind: GridOverlayKind;
+}
+
+const OVERLAY_CATEGORY: Record<GridOverlayKind, number> = {
+  route: Category.ROUTE,
+  corridor: Category.CORRIDOR,
+  restricted: Category.RESTRICTED,
+  'no-fly': Category.NO_FLY,
+  'risk-medium': Category.RISK_MEDIUM,
+  'risk-high': Category.RISK_HIGH,
+  emergency: Category.EMERGENCY,
+};
+
 /** 赤道每度米长（纬向恒定近似）。 */
 const METERS_PER_DEG_LAT = 111320.0;
 
@@ -144,6 +187,9 @@ export default class GridStateModel {
   /** 逻辑「基础类别」层（EMPTY + 选中），不含无人机叠加（length = n）。 */
   private baseCat = new Uint8Array(1);
 
+  /** 业务叠加类别层（航路/禁限飞/风险），不含选中与无人机（length = n）。 */
+  private overlayCat = new Uint8Array(1);
+
   /** 无人机占用标记（1=被无人机覆盖；length = n），用于点击时判定 drone 是否压住选中。 */
   private droneFlag = new Uint8Array(1);
 
@@ -160,6 +206,8 @@ export default class GridStateModel {
 
   /** 无人机影响标记的安全上限（防止半径过大 / 格过细导致邻域爆炸）。 */
   private readonly maxDroneCells = 200_000;
+  /** 业务图层着色的安全上限。 */
+  private readonly maxOverlayCells = 220_000;
 
   public constructor() {
     this.buildPalettes();
@@ -199,6 +247,22 @@ export default class GridStateModel {
     // SELECT_C：品红。
     setPaletteSlot(this.paletteWire, Category.SELECT_C, 191, 90, 242, 242);
     setPaletteSlot(this.paletteFill, Category.SELECT_C, 191, 90, 242, 204);
+
+    // 业务图层：航路、禁限飞、风险与应急临时空域。
+    setPaletteSlot(this.paletteWire, Category.ROUTE, 53, 196, 255, 235);
+    setPaletteSlot(this.paletteFill, Category.ROUTE, 53, 196, 255, 132);
+    setPaletteSlot(this.paletteWire, Category.CORRIDOR, 53, 240, 196, 226);
+    setPaletteSlot(this.paletteFill, Category.CORRIDOR, 53, 240, 196, 108);
+    setPaletteSlot(this.paletteWire, Category.RESTRICTED, 255, 204, 0, 235);
+    setPaletteSlot(this.paletteFill, Category.RESTRICTED, 255, 204, 0, 128);
+    setPaletteSlot(this.paletteWire, Category.NO_FLY, 255, 69, 58, 246);
+    setPaletteSlot(this.paletteFill, Category.NO_FLY, 255, 69, 58, 160);
+    setPaletteSlot(this.paletteWire, Category.RISK_MEDIUM, 255, 149, 0, 246);
+    setPaletteSlot(this.paletteFill, Category.RISK_MEDIUM, 255, 149, 0, 150);
+    setPaletteSlot(this.paletteWire, Category.RISK_HIGH, 255, 45, 85, 255);
+    setPaletteSlot(this.paletteFill, Category.RISK_HIGH, 255, 45, 85, 178);
+    setPaletteSlot(this.paletteWire, Category.EMERGENCY, 255, 159, 10, 246);
+    setPaletteSlot(this.paletteFill, Category.EMERGENCY, 255, 159, 10, 150);
   }
 
   /**
@@ -255,12 +319,16 @@ export default class GridStateModel {
     if (this.baseCat.length < n) {
       this.baseCat = new Uint8Array(n);
     }
+    if (this.overlayCat.length < n) {
+      this.overlayCat = new Uint8Array(n);
+    }
     if (this.droneFlag.length < n) {
       this.droneFlag = new Uint8Array(n);
     }
 
     // 清空当前帧使用的区段（仅前 n / texLen，避免清整段大 buffer 的浪费）。
     this.baseCat.fill(0, 0, n);
+    this.overlayCat.fill(0, 0, n);
     this.droneFlag.fill(0, 0, n);
     this.droneIds.length = 0;
     // texData 仅 R 通道有意义；这里整段（含 G/B/A）清零，保证尾部填充区也为 0。
@@ -295,14 +363,18 @@ export default class GridStateModel {
     }
   }
 
-  /** 把 baseCat 的前 n 项写入 texData 的 R 通道（行优先，纹素号 = 实例号）。 */
+  /** 把基础类别 + 业务叠加类别写入 texData 的 R 通道（行优先，纹素号 = 实例号）。 */
   private composeBaseIntoTex(): void {
     const n = this.count;
     const tex = this.texData;
-    const base = this.baseCat;
     for (let id = 0; id < n; id++) {
-      tex[id * 4] = base[id]!;
+      tex[id * 4] = this.displayCategory(id);
     }
+  }
+
+  /** 取当前无人机之下的显示类别：业务叠加优先于用户选中。 */
+  private displayCategory(id: number): number {
+    return this.overlayCat[id] || this.baseCat[id] || Category.EMPTY;
   }
 
   /**
@@ -420,7 +492,7 @@ export default class GridStateModel {
     this.baseCat[id] = next;
     // 无人机未压住该格时，立即反映到上传缓冲。
     if (this.droneFlag[id] !== 1) {
-      this.texData[id * 4] = next;
+      this.texData[id * 4] = this.displayCategory(id);
     }
     return next;
   }
@@ -446,10 +518,46 @@ export default class GridStateModel {
       if (this.baseCat[id] !== Category.EMPTY) {
         this.baseCat[id] = Category.EMPTY;
         if (this.droneFlag[id] !== 1) {
-          this.texData[id * 4] = Category.EMPTY;
+          this.texData[id * 4] = this.displayCategory(id);
         }
       }
     }
+  }
+
+  /**
+   * 设置业务叠加图层（航路/禁限飞/风险等）在当前网格上的着色。
+   *
+   * @param overlays 点/线/区域采样后的叠加输入
+   */
+  public setGridOverlays(overlays: readonly GridOverlayInput[]): void {
+    const ctx = this.ctx;
+    if (!ctx || this.count === 0) return;
+
+    this.overlayCat.fill(0, 0, this.count);
+    let marked = 0;
+    for (const overlay of overlays) {
+      const category = OVERLAY_CATEGORY[overlay.kind] ?? Category.ROUTE;
+      marked += this.markSphere(
+        overlay.lonDeg,
+        overlay.latDeg,
+        overlay.heightMeters,
+        Math.max(1, overlay.radiusMeters),
+        category,
+        this.maxOverlayCells - marked,
+      );
+      if (marked >= this.maxOverlayCells) break;
+    }
+
+    this.composeBaseIntoTex();
+    this.restoreDroneCells();
+  }
+
+  /** 清空业务叠加图层着色。 */
+  public clearGridOverlays(): void {
+    if (this.count === 0) return;
+    this.overlayCat.fill(0, 0, this.count);
+    this.composeBaseIntoTex();
+    this.restoreDroneCells();
   }
 
   /**
@@ -469,7 +577,37 @@ export default class GridStateModel {
     // ① 恢复上一次的无人机格为基础类别。
     this.restoreDroneCells();
 
-    // ② 定位无人机所在格索引。
+    this.markDroneSphere(lonDeg, latDeg, heightMeters, radiusMeters);
+
+    // 若无人机恰好落在区域外，droneIds 可能为空——此时仅核心格不可见，但不报错。
+  }
+
+  private markDroneSphere(lonDeg: number, latDeg: number, heightMeters: number, radiusMeters: number): void {
+    const ctx = this.ctx;
+    if (!ctx) return;
+    const ci = Math.floor((lonDeg - ctx.originLonDeg) / ctx.stepLonDeg);
+    const cj = Math.floor((latDeg - ctx.originLatDeg) / ctx.stepLatDeg);
+    const ck = Math.floor((heightMeters - ctx.originHeightMeters) / ctx.heightStepMeters);
+    this.markSphere(lonDeg, latDeg, heightMeters, radiusMeters, Category.DRONE_INFLUENCE, this.maxDroneCells, (id, i, j, zi) => {
+      const cat = i === ci && j === cj && zi === ck ? Category.DRONE_CORE : Category.DRONE_INFLUENCE;
+      this.texData[id * 4] = cat;
+      this.droneFlag[id] = 1;
+      this.droneIds.push(id);
+    });
+  }
+
+  private markSphere(
+    lonDeg: number,
+    latDeg: number,
+    heightMeters: number,
+    radiusMeters: number,
+    category: number,
+    limit: number,
+    onCell?: (id: number, i: number, j: number, zi: number) => void,
+  ): number {
+    const ctx = this.ctx;
+    if (!ctx || limit <= 0) return 0;
+
     const ci = Math.floor((lonDeg - ctx.originLonDeg) / ctx.stepLonDeg);
     const cj = Math.floor((latDeg - ctx.originLatDeg) / ctx.stepLatDeg);
     const ck = Math.floor((heightMeters - ctx.originHeightMeters) / ctx.heightStepMeters);
@@ -478,7 +616,6 @@ export default class GridStateModel {
     const dimY = ctx.stepLatDeg * ctx.metersPerDegLat;
     const dimZ = ctx.heightStepMeters;
 
-    // ③ 邻域半径（格数），各轴按米半径 / 米步长上取整。
     const rI = Math.max(0, Math.ceil(radiusMeters / Math.max(1e-6, dimX)));
     const rJ = Math.max(0, Math.ceil(radiusMeters / Math.max(1e-6, dimY)));
     const rK = Math.max(0, Math.ceil(radiusMeters / Math.max(1e-6, dimZ)));
@@ -494,13 +631,12 @@ export default class GridStateModel {
     let marked = 0;
 
     for (let zi = k0; zi <= k1; zi++) {
-      // 该层中心高（米，相对原点）。
       const cz = (zi + 0.5) * dimZ;
-      const droneUp = heightMeters - ctx.originHeightMeters; // 无人机相对原点的米高
-      const dUp = cz - droneUp;
+      const up = heightMeters - ctx.originHeightMeters;
+      const dUp = cz - up;
       for (let j = j0; j <= j1; j++) {
         const cyCenterLat = ctx.originLatDeg + (j + 0.5) * ctx.stepLatDeg;
-        const dNorth = (latDeg - cyCenterLat) * ctx.metersPerDegLat; // 注意符号无关（平方）
+        const dNorth = (latDeg - cyCenterLat) * ctx.metersPerDegLat;
         const baseJ = (zi * ctx.ny + j) * ctx.nx;
         for (let i = i0; i <= i1; i++) {
           const cxCenterLon = ctx.originLonDeg + (i + 0.5) * ctx.stepLonDeg;
@@ -509,21 +645,17 @@ export default class GridStateModel {
           if (dist2 > r2) continue;
 
           const id = baseJ + i;
-          const isCore = i === ci && j === cj && zi === ck;
-          const cat = isCore ? Category.DRONE_CORE : Category.DRONE_INFLUENCE;
-          this.texData[id * 4] = cat;
-          this.droneFlag[id] = 1;
-          this.droneIds.push(id);
-          marked++;
-          if (marked >= this.maxDroneCells) {
-            // 邻域过大：截断标记（避免极端配置卡顿）；已标记部分仍生效。
-            return;
+          if (onCell) {
+            onCell(id, i, j, zi);
+          } else {
+            this.overlayCat[id] = category;
           }
+          marked++;
+          if (marked >= limit) return marked;
         }
       }
     }
-
-    // 若无人机恰好落在区域外，droneIds 可能为空——此时仅核心格不可见，但不报错。
+    return marked;
   }
 
   /** 把上一次标记的无人机格恢复为基础类别，并清空标记。 */
@@ -532,7 +664,7 @@ export default class GridStateModel {
     for (let k = 0; k < ids.length; k++) {
       const id = ids[k]!;
       this.droneFlag[id] = 0;
-      this.texData[id * 4] = this.baseCat[id]!;
+      this.texData[id * 4] = this.displayCategory(id);
     }
     ids.length = 0;
   }

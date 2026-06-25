@@ -18,19 +18,74 @@ import {
   GeoJsonBoundaryLoader,
   type BoundaryLoadResult,
   type BoundaryStyle,
+  type GridOverlayInput,
   type GridPickListener,
   type PickedGridInfo,
 } from '../beidou-grid-render'
+import {
+  SIMAO_BOUNDARY_URL,
+  SIMAO_DISTRICT_CENTER as SIMAO_ADMIN_CENTER,
+  SIMAO_URBAN_CENTER,
+  type AirspaceZone,
+  type LowAltitudeFacility,
+  type LowAltitudeMission,
+  type RiskEvent,
+  type RoutePoint,
+} from './low-altitude-data'
 
-/** 普洱市行政边界（GeoJSON，DataV 阿里云）。 */
-export const PUER_BOUNDARY_URL = 'https://geo.datav.aliyun.com/areas_v3/bound/530800.json'
+/** 思茅区行政边界（GeoJSON，DataV 阿里云）。 */
+export const SIMAO_DISTRICT_BOUNDARY_URL = SIMAO_BOUNDARY_URL
 
-/** 普洱市中心（思茅区附近），作为默认定位与无人机巡航中心。 */
-export const PUER_CENTER = { lon: 100.972, lat: 22.778 } as const
+/** 思茅区行政 bbox 几何中心。 */
+export const SIMAO_DISTRICT_CENTER = SIMAO_ADMIN_CENTER
+/** 思茅主城区低空运行核心，作为默认定位、网格锚点与城市任务示范中心。 */
+export const SIMAO_OPERATION_CENTER = SIMAO_URBAN_CENTER
+/** 兼容旧调用名。 */
+export const PUER_BOUNDARY_URL = SIMAO_DISTRICT_BOUNDARY_URL
+/** 兼容旧调用名。 */
+export const PUER_CENTER = SIMAO_OPERATION_CENTER
 
 let viewer: Cesium.Viewer | undefined
 let fieldScene: BeiDouFieldScene | undefined
 let boundaryLoader: GeoJsonBoundaryLoader | undefined
+let operationEntities: Cesium.Entity[] = []
+
+export interface OperationLayerToggles {
+  routes: boolean
+  zones: boolean
+  risks: boolean
+  aircraft: boolean
+  sites: boolean
+}
+
+export interface OperationOverlayState {
+  missions: LowAltitudeMission[]
+  zones: AirspaceZone[]
+  risks: RiskEvent[]
+  facilities?: LowAltitudeFacility[]
+  activeMissionId?: string
+  toggles: OperationLayerToggles
+}
+
+const SCENARIO_COLORS: Record<string, string> = {
+  logistics: '#35c4ff',
+  emergency: '#ff3b30',
+  inspection: '#f7b731',
+  'urban-governance': '#30d158',
+  agriculture: '#8fd14f',
+  tourism: '#c77dff',
+  uam: '#00e5a8',
+  surveying: '#64d2ff',
+}
+
+const ZONE_COLORS: Record<AirspaceZone['type'], string> = {
+  corridor: '#35f0c4',
+  takeoff: '#35c4ff',
+  landing: '#30d158',
+  'no-fly': '#ff453a',
+  restricted: '#ffd60a',
+  emergency: '#ff9500',
+}
 
 /**
  * 初始化 Viewer 并创建北斗立方体场渲染编排器。
@@ -80,15 +135,15 @@ export const init = (element: HTMLDivElement, config?: BeiDouFieldConfig): Cesiu
   // 不随相机倾斜/远近/平移重算；调用方可在 config 里覆盖。
   fieldScene = new BeiDouFieldScene(viewer, {
     ...config,
-    anchorLonDeg: config?.anchorLonDeg ?? PUER_CENTER.lon,
-    anchorLatDeg: config?.anchorLatDeg ?? PUER_CENTER.lat,
+    anchorLonDeg: config?.anchorLonDeg ?? SIMAO_OPERATION_CENTER.lon,
+    anchorLatDeg: config?.anchorLatDeg ?? SIMAO_OPERATION_CENTER.lat,
   })
 
   // 边界加载器（独立图层，挂在场景 primitives 上）。
   boundaryLoader = new GeoJsonBoundaryLoader(viewer.scene.primitives)
 
-  // 默认飞向普洱市，便于直接观察。
-  flyToPoint(PUER_CENTER.lon, PUER_CENTER.lat, 0, 6000, 0)
+  // 默认飞向思茅区，便于直接观察低空经济示范场景。
+  flyToPoint(SIMAO_OPERATION_CENTER.lon, SIMAO_OPERATION_CENTER.lat, 0, 6000, 0)
 
   return viewer
 }
@@ -118,6 +173,31 @@ export const clearSelections = (): void => {
 /** 监听点击拾取到的网格编码；返回取消监听函数。 */
 export const onGridPick = (listener: GridPickListener): (() => void) => {
   return fieldScene?.onGridPick(listener) ?? (() => undefined)
+}
+
+/** 设置业务叠加网格着色（航路/禁限飞/风险等）。 */
+export const setGridOverlays = (overlays: readonly GridOverlayInput[]): void => {
+  fieldScene?.setGridOverlays(overlays)
+}
+
+/** 清空业务叠加网格着色。 */
+export const clearGridOverlays = (): void => {
+  fieldScene?.clearGridOverlays()
+}
+
+/** 用当前任务位置驱动网格影响范围着色。 */
+export const setActiveMissionInfluence = (
+  lon: number,
+  lat: number,
+  height: number,
+  radius: number,
+): void => {
+  fieldScene?.setActiveMissionInfluence(lon, lat, height, radius)
+}
+
+/** 清空当前任务影响范围。 */
+export const clearActiveMissionInfluence = (): void => {
+  fieldScene?.clearActiveMissionInfluence()
 }
 
 // ──────────────────────────────────────────────
@@ -221,6 +301,214 @@ export const clearBoundary = (): void => {
   boundaryLoader?.clear()
 }
 
+/** 绘制低空经济业务图层：航线、空域区、起降点、机位和风险点。 */
+export const setOperationOverlays = (state: OperationOverlayState): void => {
+  if (!viewer || viewer.isDestroyed()) return
+  clearOperationOverlays()
+
+  const entities = viewer.entities
+  const activeMission = state.missions.find((mission) => mission.id === state.activeMissionId)
+
+  if (state.toggles.zones) {
+    for (const zone of state.zones) {
+      drawZone(zone)
+    }
+  }
+
+  if (state.toggles.sites && state.facilities) {
+    for (const facility of state.facilities) {
+      const color = Cesium.Color.fromCssColorString(SCENARIO_COLORS[facility.scenario ?? 'logistics'] ?? '#35c4ff')
+      operationEntities.push(entities.add({
+        name: facility.name,
+        position: Cesium.Cartesian3.fromDegrees(facility.lon, facility.lat, 25),
+        billboard: undefined,
+        point: {
+          pixelSize: facility.type === 'vertiport' ? 13 : 10,
+          color,
+          outlineColor: Cesium.Color.WHITE,
+          outlineWidth: 2,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+        label: {
+          text: facility.name,
+          font: '600 11px "Microsoft YaHei",sans-serif',
+          fillColor: Cesium.Color.WHITE,
+          showBackground: true,
+          backgroundColor: color.withAlpha(0.62),
+          pixelOffset: new Cesium.Cartesian2(0, -18),
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+      }))
+    }
+  }
+
+  if (state.toggles.routes) {
+    for (const mission of state.missions) {
+      const active = mission.id === state.activeMissionId
+      const color = Cesium.Color.fromCssColorString(SCENARIO_COLORS[mission.scenario] ?? '#35c4ff')
+      const entity = entities.add({
+        name: mission.name,
+        polyline: {
+          positions: routePositions(mission.route),
+          width: active ? 5 : 2,
+          material: color.withAlpha(active ? 0.95 : 0.52),
+          clampToGround: false,
+        },
+      })
+      operationEntities.push(entity)
+    }
+  }
+
+  if (state.toggles.aircraft && activeMission) {
+    const current = activeMission.route.length > 0
+      ? interpolateRouteLocal(activeMission.route, activeMission.progress)
+      : { lon: SIMAO_OPERATION_CENTER.lon, lat: SIMAO_OPERATION_CENTER.lat, height: 150 }
+    const color = Cesium.Color.fromCssColorString(SCENARIO_COLORS[activeMission.scenario] ?? '#35c4ff')
+    operationEntities.push(entities.add({
+      name: `${activeMission.name} 当前位置`,
+      position: Cesium.Cartesian3.fromDegrees(current.lon, current.lat, current.height),
+      point: {
+        pixelSize: activeMission.aircraftType === 'evtol' ? 14 : 11,
+        color,
+        outlineColor: Cesium.Color.WHITE,
+        outlineWidth: 2,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+      label: {
+        text: activeMission.aircraftType === 'evtol' ? 'eVTOL' : activeMission.aircraftType === 'helicopter' ? '救援机' : '无人机',
+        font: '600 12px "Microsoft YaHei",sans-serif',
+        fillColor: Cesium.Color.WHITE,
+        showBackground: true,
+        backgroundColor: color.withAlpha(0.72),
+        pixelOffset: new Cesium.Cartesian2(0, -20),
+        verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+    }))
+  }
+
+  if (state.toggles.risks) {
+    for (const risk of state.risks) {
+      const high = risk.level === 'high'
+      const color = Cesium.Color.fromCssColorString(high ? '#ff2d55' : '#ff9500')
+      operationEntities.push(entities.add({
+        name: risk.title,
+        position: Cesium.Cartesian3.fromDegrees(risk.lon, risk.lat, risk.height),
+        point: {
+          pixelSize: high ? 13 : 10,
+          color,
+          outlineColor: Cesium.Color.WHITE,
+          outlineWidth: 2,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+        label: {
+          text: high ? '高风险' : '中风险',
+          font: '600 12px "Microsoft YaHei",sans-serif',
+          fillColor: Cesium.Color.WHITE,
+          showBackground: true,
+          backgroundColor: color.withAlpha(0.74),
+          pixelOffset: new Cesium.Cartesian2(0, -18),
+          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+      }))
+    }
+  }
+}
+
+export const clearOperationOverlays = (): void => {
+  if (!viewer || viewer.isDestroyed()) {
+    operationEntities = []
+    return
+  }
+  for (const entity of operationEntities) {
+    viewer.entities.remove(entity)
+  }
+  operationEntities = []
+}
+
+const drawZone = (zone: AirspaceZone): void => {
+  if (!viewer || viewer.isDestroyed()) return
+  const color = Cesium.Color.fromCssColorString(ZONE_COLORS[zone.type] ?? '#35c4ff')
+
+  if (zone.polygon && zone.polygon.length >= 3) {
+    operationEntities.push(viewer.entities.add({
+      name: zone.name,
+      polygon: {
+        hierarchy: new Cesium.PolygonHierarchy(
+          zone.polygon.map((point) => Cesium.Cartesian3.fromDegrees(point.lon, point.lat, zone.heightRange.min)),
+        ),
+        height: zone.heightRange.min,
+        extrudedHeight: zone.heightRange.max,
+        material: color.withAlpha(zone.type === 'no-fly' ? 0.22 : 0.14),
+        outline: true,
+        outlineColor: color.withAlpha(0.82),
+      },
+    }))
+    const labelPosition = Cesium.Cartesian3.fromDegrees(zone.center.lon, zone.center.lat, zone.heightRange.max + 35)
+    operationEntities.push(viewer.entities.add({
+      name: `${zone.name} 标签`,
+      position: labelPosition,
+      label: {
+        text: zone.name,
+        font: '600 12px "Microsoft YaHei",sans-serif',
+        fillColor: Cesium.Color.WHITE,
+        showBackground: true,
+        backgroundColor: color.withAlpha(0.62),
+        pixelOffset: new Cesium.Cartesian2(0, -8),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+    }))
+    return
+  }
+
+  if (zone.radiusMeters && zone.radiusMeters > 0) {
+    operationEntities.push(viewer.entities.add({
+      name: zone.name,
+      position: Cesium.Cartesian3.fromDegrees(zone.center.lon, zone.center.lat, zone.heightRange.max),
+      ellipse: {
+        semiMajorAxis: zone.radiusMeters,
+        semiMinorAxis: zone.radiusMeters,
+        height: zone.heightRange.min,
+        extrudedHeight: zone.heightRange.max,
+        material: color.withAlpha(zone.type === 'no-fly' ? 0.2 : 0.13),
+        outline: true,
+        outlineColor: color.withAlpha(0.82),
+      },
+      label: {
+        text: zone.name,
+        font: '600 12px "Microsoft YaHei",sans-serif',
+        fillColor: Cesium.Color.WHITE,
+        showBackground: true,
+        backgroundColor: color.withAlpha(0.62),
+        pixelOffset: new Cesium.Cartesian2(0, -18),
+        verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+    }))
+  }
+}
+
+const routePositions = (route: readonly RoutePoint[]): Cesium.Cartesian3[] =>
+  route.map((point) => Cesium.Cartesian3.fromDegrees(point.lon, point.lat, point.height))
+
+const interpolateRouteLocal = (route: readonly RoutePoint[], progress: number): RoutePoint => {
+  if (route.length === 0) return { lon: SIMAO_OPERATION_CENTER.lon, lat: SIMAO_OPERATION_CENTER.lat, height: 120 }
+  if (route.length === 1) return { ...route[0]! }
+  const clamped = Math.min(100, Math.max(0, progress))
+  const scaled = (clamped / 100) * (route.length - 1)
+  const index = Math.min(route.length - 2, Math.floor(scaled))
+  const t = scaled - index
+  const a = route[index]!
+  const b = route[index + 1]!
+  return {
+    lon: a.lon + (b.lon - a.lon) * t,
+    lat: a.lat + (b.lat - a.lat) * t,
+    height: a.height + (b.height - a.height) * t,
+  }
+}
+
 /** 强制重建一次。 */
 export const refreshAll = (): void => {
   fieldScene?.refresh()
@@ -266,6 +554,7 @@ export const dispose = (): void => {
   fieldScene = undefined
   boundaryLoader?.destroy()
   boundaryLoader = undefined
+  clearOperationOverlays()
   if (viewer && !viewer.isDestroyed()) {
     viewer.destroy()
   }
@@ -278,5 +567,6 @@ export type {
   HeightRange,
   BoundaryLoadResult,
   BoundaryStyle,
+  GridOverlayInput,
   PickedGridInfo,
 }

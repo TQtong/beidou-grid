@@ -26,7 +26,7 @@ import {
   type Viewer,
 } from 'cesium';
 
-import GridCubeField, { type FieldMode, type PickedGridInfo } from '../core/GridCubeField';
+import GridCubeField, { type FieldMode, type GridOverlayInput, type PickedGridInfo } from '../core/GridCubeField';
 import DroneController from './DroneController';
 import ScaleLevelSelector, { type LevelPxConfig } from '../level/ScaleLevelSelector';
 import ViewRegionResolver, { type RegionResult } from '../region/ViewRegionResolver';
@@ -230,6 +230,26 @@ export default class BeiDouFieldScene {
         this.pickListener = undefined;
       }
     };
+  }
+
+  /** 设置业务叠加网格着色（航路/禁限飞/风险等）。 */
+  public setGridOverlays(overlays: readonly GridOverlayInput[]): void {
+    this.field.setGridOverlays(overlays);
+  }
+
+  /** 清空业务叠加网格着色。 */
+  public clearGridOverlays(): void {
+    this.field.clearGridOverlays();
+  }
+
+  /** 用任务当前位置驱动已有无人机影响范围着色。 */
+  public setActiveMissionInfluence(lonDeg: number, latDeg: number, heightMeters: number, radiusMeters: number): void {
+    this.field.setDroneInfluence(lonDeg, latDeg, heightMeters, radiusMeters);
+  }
+
+  /** 清空任务影响范围着色。 */
+  public clearActiveMissionInfluence(): void {
+    this.field.clearDrone();
   }
 
   // ──────────────────────────────────────────────

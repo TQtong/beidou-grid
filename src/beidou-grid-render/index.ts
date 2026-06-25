@@ -64,7 +64,7 @@ export type { BeiDouFieldConfig, GridPickListener } from './control/BeiDouFieldS
 export { default as DroneController } from './control/DroneController';
 export type { DronePosition } from './control/DroneController';
 export { default as GridCubeField } from './core/GridCubeField';
-export type { FieldMode, PickCallback, PickedGridInfo } from './core/GridCubeField';
+export type { FieldMode, GridOverlayInput, PickCallback, PickedGridInfo } from './core/GridCubeField';
 export { default as GridStateModel, Category } from './core/GridStateModel';
 export type { GridCellInfo } from './core/GridStateModel';
 export { default as InstancePicker } from './core/InstancePicker';

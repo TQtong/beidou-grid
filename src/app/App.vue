@@ -38,7 +38,6 @@ import {
   type PickedGridInfo,
 } from './index'
 import {
-  LOW_ALTITUDE_MISSIONS,
   SIMAO_BBOX,
   scenarioById,
   type LowAltitudeMission,
@@ -229,13 +228,80 @@ interface FlightPlan {
   level: number
   color: string
 }
+// 航路时窗演示计划（App.vue 常量）：数据集里的真实任务各自分散、且高度层不同，
+// 三维网格码互不相交，无法演示"同格同窗"冲突。故按思茅城区真实地理构造三条申报计划——
+// 物流(A)与城管(B)共享同一条城区出港走廊、同一巡航高度，且邻近时刻起飞（A 0s / B 20s）：
+// 二者在共享段"同格同窗"，触发冲突；巡检(C)独立于南部、晚起飞，作对照。
+// 坐标全部落在 SIMAO_BBOX 内。各计划起飞相对秒见 CORRIDOR_START_SEC。
+const CORRIDOR_START_SEC = [0, 20, 180]
+const CORRIDOR_PLANS: LowAltitudeMission[] = [
+  {
+    id: 'cor-logistics',
+    name: '城区医疗冷链配送',
+    scenario: 'logistics',
+    status: 'running',
+    priority: 'important',
+    aircraftType: 'drone',
+    route: [
+      { lon: 100.936, lat: 22.793, height: 150 }, // 思茅低空服务中心（共享出港点）
+      { lon: 100.964, lat: 22.782, height: 150 }, // 共享走廊段
+      { lon: 100.988, lat: 22.772, height: 150 }, // 共享走廊段（之后分流）
+      { lon: 101.02, lat: 22.758, height: 150 },
+      { lon: 101.044, lat: 22.74, height: 150 },
+    ],
+    influenceRadius: 200,
+    progress: 32,
+    operator: '思茅低空物流专班',
+    payload: '医疗冷链包裹',
+    etaMinutes: 9,
+  },
+  {
+    id: 'cor-urban',
+    name: '城区治理巡查',
+    scenario: 'urban-governance',
+    status: 'running',
+    priority: 'normal',
+    aircraftType: 'drone',
+    route: [
+      { lon: 100.936, lat: 22.793, height: 150 }, // 同一出港点
+      { lon: 100.964, lat: 22.782, height: 150 }, // 共享走廊段
+      { lon: 100.988, lat: 22.772, height: 150 }, // 共享走廊段（之后分流）
+      { lon: 101.002, lat: 22.748, height: 150 },
+      { lon: 101.01, lat: 22.726, height: 150 },
+    ],
+    influenceRadius: 180,
+    progress: 24,
+    operator: '城市运行管理中心',
+    payload: '城市治理巡查吊舱',
+    etaMinutes: 11,
+  },
+  {
+    id: 'cor-inspection',
+    name: '南部输电走廊巡检',
+    scenario: 'inspection',
+    status: 'planned',
+    priority: 'important',
+    aircraftType: 'drone',
+    route: [
+      { lon: 100.438, lat: 22.552, height: 180 },
+      { lon: 100.552, lat: 22.588, height: 180 },
+      { lon: 100.702, lat: 22.632, height: 180 },
+      { lon: 100.858, lat: 22.671, height: 180 },
+    ],
+    influenceRadius: 220,
+    progress: 12,
+    operator: '电网巡检中心',
+    payload: '红外与可见光吊舱',
+    etaMinutes: 37,
+  },
+]
 const flightPlans = ref<FlightPlan[]>(
-  LOW_ALTITUDE_MISSIONS.slice(0, 3).map((m, i) => ({
+  CORRIDOR_PLANS.map((m, i) => ({
     id: m.id,
     name: m.name,
     mission: m,
     speedMps: m.aircraftType === 'helicopter' ? 28 : m.aircraftType === 'evtol' ? 36 : 16,
-    startSec: i * 90,
+    startSec: CORRIDOR_START_SEC[i] ?? i * 90,
     level: 6,
     color: scenarioById(m.scenario).color,
   })),
@@ -266,6 +332,13 @@ const selectedSequence = computed<TimeWindowCell[]>(
 
 const planCellCount = (id: string): number => planSequences.value[id]?.length ?? 0
 const planNameById = (id: string): string => flightPlans.value.find((p) => p.id === id)?.name ?? id
+
+// 冲突时窗文案：同时占用同一格 → "重叠 a–b"；半小时内先后复用同一格（无同时段）→
+// "复用间隔 g < 30:00"。后者由保护带捕获，overlapStart 会大于 overlapEnd。
+const formatConflictWindow = (c: GridConflict): string =>
+  c.overlapStartSec <= c.overlapEndSec
+    ? `重叠 ${formatRelSec(c.overlapStartSec)}–${formatRelSec(c.overlapEndSec)}`
+    : `复用间隔 ${formatRelSec(c.overlapStartSec - c.overlapEndSec)} < 30:00`
 
 const selectedRouteKm = computed(() =>
   selectedPlan.value ? routeLengthMeters(selectedPlan.value.mission.route) / 1000 : 0,
@@ -786,9 +859,7 @@ onBeforeUnmount(() => {
             <li v-for="(c, i) in conflicts.slice(0, 6)" :key="c.code3D + i" class="conflict-item">
               <div class="conflict-code mono">{{ c.code3D }}</div>
               <div class="conflict-pair">{{ planNameById(c.planA) }} ⇄ {{ planNameById(c.planB) }}</div>
-              <div class="conflict-win mono">
-                重叠 {{ formatRelSec(c.overlapStartSec) }}–{{ formatRelSec(c.overlapEndSec) }}
-              </div>
+              <div class="conflict-win mono">{{ formatConflictWindow(c) }}</div>
             </li>
           </ul>
         </section>

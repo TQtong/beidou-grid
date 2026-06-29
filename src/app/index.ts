@@ -49,6 +49,15 @@ let viewer: Cesium.Viewer | undefined
 let fieldScene: BeiDouFieldScene | undefined
 let boundaryLoader: GeoJsonBoundaryLoader | undefined
 let operationEntities: Cesium.Entity[] = []
+/** 光标地理读数监听句柄（onCursorReadout 装，dispose 时 destroy）。 */
+let cursorHandler: Cesium.ScreenSpaceEventHandler | undefined
+
+/** 光标在 3D 场景上的地理读数（经纬度 + 地形高）。 */
+export interface CursorReadout {
+  lonDeg: number
+  latDeg: number
+  heightMeters: number
+}
 
 export interface OperationLayerToggles {
   routes: boolean
@@ -267,6 +276,70 @@ export const setDroneOrbitRadius = (meters: number): void => {
 // ──────────────────────────────────────────────
 // 边界 / 相机 / 生命周期
 // ──────────────────────────────────────────────
+
+/**
+ * 订阅鼠标在 3D 场景上的地理读数（经纬度 + 地形高）。
+ * 鼠标移出地球时回调 undefined；返回取消订阅函数。
+ *
+ * @param listener 读数监听器（undefined 表示光标不在地球上）
+ * @returns        取消订阅函数
+ */
+export const onCursorReadout = (
+  listener: (r: CursorReadout | undefined) => void,
+): (() => void) => {
+  if (!viewer || viewer.isDestroyed()) return () => undefined
+  // 同一时刻仅保留一个光标 handler。
+  cursorHandler?.destroy()
+  const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas)
+  cursorHandler = handler
+  handler.setInputAction((movement: Cesium.ScreenSpaceEventHandler.MotionEvent) => {
+    if (!viewer || viewer.isDestroyed()) {
+      listener(undefined)
+      return
+    }
+    const ray = viewer.camera.getPickRay(movement.endPosition)
+    const cart = ray ? viewer.scene.globe.pick(ray, viewer.scene) : undefined
+    if (!cart) {
+      listener(undefined)
+      return
+    }
+    const carto = Cesium.Cartographic.fromCartesian(cart)
+    listener({
+      lonDeg: Cesium.Math.toDegrees(carto.longitude),
+      latDeg: Cesium.Math.toDegrees(carto.latitude),
+      heightMeters: carto.height,
+    })
+  }, Cesium.ScreenSpaceEventType.MOUSE_MOVE)
+  return () => {
+    if (cursorHandler === handler) {
+      handler.destroy()
+      cursorHandler = undefined
+    }
+  }
+}
+
+/**
+ * 相机飞向给定经纬 bbox。
+ *
+ * @param west     西经度（度）
+ * @param south    南纬度（度）
+ * @param east     东经度（度）
+ * @param north    北纬度（度）
+ * @param duration 飞行时长（秒）
+ */
+export const flyToBBox = (
+  west: number,
+  south: number,
+  east: number,
+  north: number,
+  duration = 1.2,
+): void => {
+  if (!viewer || viewer.isDestroyed()) return
+  viewer.camera.flyTo({
+    destination: Cesium.Rectangle.fromDegrees(west, south, east, north),
+    duration,
+  })
+}
 
 /**
  * 加载行政区/区域 GeoJSON 边界（贴地折线 Primitive），可选飞到其 bbox。
@@ -550,6 +623,8 @@ export const flyToPoint = (
 
 /** 销毁：释放渲染层 + Viewer。 */
 export const dispose = (): void => {
+  cursorHandler?.destroy()
+  cursorHandler = undefined
   fieldScene?.dispose()
   fieldScene = undefined
   boundaryLoader?.destroy()

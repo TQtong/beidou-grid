@@ -1,2966 +1,1838 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
+// ============================================================
+// App.vue — 北斗网格 · 低空空域管制台（四场景，单文件）
+// 共享一个 BeiDouFieldScene 引擎核心，顶栏 tab 在四个专业场景间切换：
+//   ① SUB 空域剖分  ② ISO 网格隔离  ③ COR 航路时窗  ④ TRK 实时航迹
+// 业务逻辑全部走 grid-workflows 纯函数；视觉效果只走引擎既有 API。
+// ============================================================
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   clearActiveMissionInfluence,
   clearGridOverlays,
   clearSelections,
   dispose,
+  flyToBBox,
   flyToPoint,
   getActiveLevel,
   init,
+  isDroneRunning,
   loadBoundary,
+  onCursorReadout,
   onGridPick,
-  setActiveMissionInfluence,
   setBoundaryVisible,
+  setDroneAltitude,
+  setDroneInfluenceRadius,
+  setDroneOrbitRadius,
+  setDroneSpeed,
   setFillOpacity,
   setGivenRange,
   setGridOverlays,
   setLevelOverride,
   setMode,
-  setOperationOverlays,
+  startDrone,
+  stopDrone,
   SIMAO_DISTRICT_BOUNDARY_URL,
   SIMAO_OPERATION_CENTER,
-  type FieldMode,
+  type CursorReadout,
   type GridOverlayInput,
-  type OperationLayerToggles,
   type PickedGridInfo,
 } from './index'
 import {
-  AIRSPACE_ZONES,
-  AIRCRAFT_REGISTRY,
-  AREA_LOADS,
-  FLIGHT_PLAN_APPROVALS,
-  FLIGHT_TRENDS,
-  INDUSTRY_METRICS,
-  LOW_ALTITUDE_FACILITIES,
   LOW_ALTITUDE_MISSIONS,
-  LOW_ALTITUDE_OPERATORS,
-  OPERATION_NOTICES,
-  RISK_EVENTS,
-  SCENARIOS,
   SIMAO_BBOX,
-  aircraftLabel,
-  aircraftStatusLabel,
-  approvalStatusLabel,
-  facilityTypeLabel,
-  interpolateRoute,
-  operatorTypeLabel,
-  priorityLabel,
-  riskLevelLabel,
-  sampleRoute,
   scenarioById,
-  scenarioForRisk,
-  statusLabel,
-  type AirspaceZone,
-  type LowAltitudeFacility,
   type LowAltitudeMission,
-  type LowAltitudeScenario,
-  type RiskEvent,
 } from './low-altitude-data'
+import {
+  assignTimeWindows,
+  codeAt,
+  detectConflicts,
+  formatRelSec,
+  gridifyRoute,
+  isolationCells,
+  levelForAircraftSize,
+  routeLengthMeters,
+  type GridConflict,
+  type TimeWindowCell,
+} from './grid-workflows'
 
-type ScenarioFilter = 'all' | LowAltitudeScenario
-type ModuleId = 'overview' | 'airspace' | 'approval' | 'industry'
+// ──────────────────────────────────────────────
+// 场景定义
+// ──────────────────────────────────────────────
+type ScenarioId = 'sub' | 'iso' | 'cor' | 'trk'
 
-const container = useTemplateRef<HTMLDivElement>('container')
-
-const activeScenario = ref<ScenarioFilter>('all')
-const activeModule = ref<ModuleId>('overview')
-const modulePanelOpen = ref<boolean>(false)
-const selectedMissionId = ref<string>(LOW_ALTITUDE_MISSIONS[0]!.id)
-const pickedGrid = ref<PickedGridInfo | undefined>(undefined)
-const isPlaying = ref<boolean>(true)
-const mapReady = ref<boolean>(false)
-
-const renderMode = ref<FieldMode>('wire')
-const fillOpacity = ref<number>(58)
-const levelMode = ref<number | 'auto'>(5)
-const activeLevel = ref<number>(5)
-const showBoundary = ref<boolean>(true)
-const showGridOverlay = ref<boolean>(true)
-
-const operationToggles = ref<OperationLayerToggles>({
-  routes: true,
-  zones: true,
-  risks: true,
-  aircraft: true,
-  sites: true,
-})
-
-const missionProgress = ref<Record<string, number>>(
-  Object.fromEntries(LOW_ALTITUDE_MISSIONS.map((mission) => [mission.id, mission.progress])),
-)
-
-const levelOptions = [
-  { label: '自动', value: 'auto' as const },
-  ...Array.from({ length: 10 }, (_v, i) => ({ label: `L${i + 1}`, value: i + 1 })),
+const SCENARIO_TABS: { id: ScenarioId; code: string; name: string }[] = [
+  { id: 'sub', code: 'SUB', name: '空域剖分' },
+  { id: 'iso', code: 'ISO', name: '网格隔离' },
+  { id: 'cor', code: 'COR', name: '航路时窗' },
+  { id: 'trk', code: 'TRK', name: '实时航迹' },
 ]
-
-const moduleTabs = [
-  { id: 'overview' as const, label: '运行态势' },
-  { id: 'airspace' as const, label: '空域资源' },
-  { id: 'approval' as const, label: '计划审批' },
-  { id: 'industry' as const, label: '产业分析' },
-]
-
-const moduleLayerPresets = {
-  overview: {
-    routes: true,
-    zones: true,
-    risks: true,
-    aircraft: true,
-    sites: true,
-    grid: true,
-    mode: 'wire',
-    opacity: 58,
-  },
-  airspace: {
-    routes: true,
-    zones: true,
-    risks: false,
-    aircraft: false,
-    sites: true,
-    grid: true,
-    mode: 'fill',
-    opacity: 34,
-  },
-  approval: {
-    routes: true,
-    zones: true,
-    risks: true,
-    aircraft: true,
-    sites: false,
-    grid: true,
-    mode: 'wire',
-    opacity: 62,
-  },
-  industry: {
-    routes: true,
-    zones: false,
-    risks: false,
-    aircraft: true,
-    sites: true,
-    grid: false,
-    mode: 'wire',
-    opacity: 46,
-  },
-} satisfies Record<ModuleId, OperationLayerToggles & { grid: boolean; mode: FieldMode; opacity: number }>
-
-const moduleProfiles = {
-  overview: {
-    title: '运行态势总览',
-    subtitle: '按低空飞行服务系统席位组织监视、情报、气象、协调与救援联动。',
-    badge: '动态监控席',
-  },
-  airspace: {
-    title: '空域资源编排',
-    subtitle: '区分管制空域、适飞空域、临时管制空域与低空航路走廊。',
-    badge: '航空情报席',
-  },
-  approval: {
-    title: '飞行计划审批',
-    subtitle: '围绕任务性质、飞行空域、日期、起降场、机尾号和计划状态闭环校验。',
-    badge: '飞行计划席',
-  },
-  industry: {
-    title: '低空产业运行',
-    subtitle: '面向航空器、运营服务、场景应用和基础设施统计低空经济运行质量。',
-    badge: '产业运营席',
-  },
-} as const
-
-const activeModuleProfile = computed(() => moduleProfiles[activeModule.value])
-
-const overviewDutyBoard = [
-  { seat: '动态监控席', status: '在线', focus: '航迹融合、网格拾取、偏航告警' },
-  { seat: '运行协调席', status: '在线', focus: '跨场景任务冲突协调' },
-  { seat: '航空气象席', status: '关注', focus: '山区阵风、能见度、降雨窗口' },
-  { seat: '协助救援席', status: '待命', focus: '应急空域、救援航线、备降点' },
-]
-
-const serviceSeats = [
-  '飞行计划席',
-  '航空情报席',
-  '航空气象席',
-  '运行协调席',
-  '协助救援席',
-  '飞行动态监控席',
-]
-
-const airspaceRuleCards = [
-  { title: '管制空域', detail: '需经空中交通管理机构批准后实施飞行活动。' },
-  { title: '适飞空域', detail: '管制空域外的微型、轻型、小型无人机适飞空间。' },
-  { title: '临时管制', detail: '重大活动、抢险救灾、医疗救护等可临时增设。' },
-  { title: '隔离运行', detail: '无人驾驶航空器通常应与有人驾驶航空器隔离飞行。' },
-]
-
-const approvalSteps = [
-  { label: '计划受理', value: '任务/空域/时窗' },
-  { label: '资料关联', value: '气象/情报/起降场' },
-  { label: '风险校核', value: '禁限飞/冲突/高度' },
-  { label: '协调放行', value: '运行协调/动态监控' },
-]
-
-const planQueryFields = ['任务性质', '飞行空域', '日期', '起降场', '机尾号', '计划状态']
-
-const industryChain = [
-  { label: '航空器制造', value: 'eVTOL/无人机/直升机' },
-  { label: '运行服务', value: '物流/巡检/应急/文旅' },
-  { label: '基础设施', value: '起降场/换电/通信导航' },
-  { label: '数据平台', value: '飞服/监管/网格编码' },
-]
-
-const altitudeBands = [
-  { label: '0-120m', name: '城市治理/植保', load: 76 },
-  { label: '120-300m', name: '物流/巡检走廊', load: 64 },
-  { label: '300-600m', name: '应急/UAM 验证', load: 42 },
-]
-
-const airspaceGridLedger = [
-  { name: '主城区精细监管网格', level: 'L5/L6', owner: '城市治理、物流配送', capacity: 82 },
-  { name: '机场净空保护网格', level: 'L4/L5', owner: '净空保护、飞行计划复核', capacity: 58 },
-  { name: '南部茶园作业网格', level: 'L5', owner: '农林植保、换电保障', capacity: 61 },
-  { name: '西北山区救援网格', level: 'L4', owner: '应急救援、气象监测', capacity: 44 },
-]
-
-const approvalChecklist = [
-  { item: '经营主体与操控员资质', owner: '飞行计划席', state: '已核验' },
-  { item: '实名登记与航空器识别', owner: '动态监控席', state: '已核验' },
-  { item: '任务性质、空域、日期、起降点', owner: '飞行计划席', state: '待复核' },
-  { item: '禁飞/限飞/临时管制冲突', owner: '航空情报席', state: '待复核' },
-  { item: '气象条件与备降预案', owner: '航空气象席', state: '关注' },
-  { item: '应急处置与动态监控联动', owner: '运行协调席', state: '已核验' },
-]
-
-const approvalDecisionRules = [
-  { title: '微轻小型无人机', detail: '适飞空域内按计划与动态监控要素校核。' },
-  { title: '管制空域飞行', detail: '需重点校核空域批准、时窗、起降点和运行隔离。' },
-  { title: '应急救援任务', detail: '允许临时空域协同，优先保障救援与医疗运输。' },
-]
-
-const industryScenarioCards = [
-  { scenario: 'logistics' as const, focus: '医疗冷链、即时配送', value: '时效网络', maturity: 78 },
-  { scenario: 'emergency' as const, focus: '搜救投送、灾情侦察', value: '公共安全', maturity: 62 },
-  { scenario: 'inspection' as const, focus: '电力、管线、道路巡检', value: '降本增效', maturity: 69 },
-  { scenario: 'urban-governance' as const, focus: '违建识别、交通治理', value: '城市精治', maturity: 74 },
-  { scenario: 'agriculture' as const, focus: '茶园植保、农情监测', value: '特色农业', maturity: 71 },
-  { scenario: 'tourism' as const, focus: '航拍观光、活动保障', value: '文旅消费', maturity: 56 },
-  { scenario: 'uam' as const, focus: 'eVTOL 接驳验证', value: '未来交通', maturity: 38 },
-  { scenario: 'surveying' as const, focus: '生态测绘、环保巡测', value: '绿色治理', maturity: 66 },
-]
-
-let levelTimer: number | undefined
-let playTimer: number | undefined
-let offGridPick: (() => void) | undefined
-
-const runtimeMissions = computed<LowAltitudeMission[]>(() =>
-  LOW_ALTITUDE_MISSIONS.map((mission) => {
-    const progress = missionProgress.value[mission.id] ?? mission.progress
-    return {
-      ...mission,
-      progress,
-      status: progress >= 100 ? 'completed' : mission.status === 'completed' && progress < 100 ? 'running' : mission.status,
-    }
-  }),
-)
-
-const filteredMissions = computed(() => {
-  if (activeScenario.value === 'all') return runtimeMissions.value
-  return runtimeMissions.value.filter((mission) => mission.scenario === activeScenario.value)
-})
-
-const selectedMission = computed(() => {
-  return runtimeMissions.value.find((mission) => mission.id === selectedMissionId.value) ?? filteredMissions.value[0]
-})
-
-const visibleZones = computed(() => {
-  if (activeScenario.value === 'all') return AIRSPACE_ZONES
-  return AIRSPACE_ZONES.filter((zone) => !zone.scenario || zone.scenario === activeScenario.value)
-})
-
-const visibleRisks = computed(() => {
-  if (activeScenario.value === 'all') return RISK_EVENTS
-  return RISK_EVENTS.filter((event) => scenarioForRisk(event, runtimeMissions.value) === activeScenario.value)
-})
-
-const visibleFacilities = computed(() => {
-  if (activeScenario.value === 'all') return LOW_ALTITUDE_FACILITIES
-  return LOW_ALTITUDE_FACILITIES.filter((facility) => !facility.scenario || facility.scenario === activeScenario.value)
-})
-
-const selectedRisks = computed(() =>
-  visibleRisks.value.filter((event) => !selectedMission.value || event.missionId === selectedMission.value.id),
-)
-
-const approvalQueue = computed(() =>
-  FLIGHT_PLAN_APPROVALS.map((approval) => ({
-    ...approval,
-    mission: runtimeMissions.value.find((mission) => mission.id === approval.missionId),
-  })).filter((approval) => activeScenario.value === 'all' || approval.mission?.scenario === activeScenario.value),
-)
-
-const operatorSummary = computed(() => {
-  const aircraft = AIRCRAFT_REGISTRY.length
-  const online = AIRCRAFT_REGISTRY.filter((item) => item.status === 'online').length
-  const pilots = LOW_ALTITUDE_OPERATORS.reduce((sum, item) => sum + item.pilots, 0)
-  const sorties = LOW_ALTITUDE_OPERATORS.reduce((sum, item) => sum + item.monthlySorties, 0)
-  return { aircraft, online, pilots, sorties }
-})
-
-const averageCompliance = computed(() =>
-  (LOW_ALTITUDE_OPERATORS.reduce((sum, item) => sum + item.complianceRate, 0) / LOW_ALTITUDE_OPERATORS.length).toFixed(1),
-)
-
-const facilityAvailabilityRate = computed(() => {
-  const capacity = LOW_ALTITUDE_FACILITIES.reduce((sum, item) => sum + item.capacity, 0)
-  const available = LOW_ALTITUDE_FACILITIES.reduce((sum, item) => sum + item.available, 0)
-  return capacity > 0 ? Math.round((available / capacity) * 100) : 0
-})
-
-const operatorRanking = computed(() =>
-  [...LOW_ALTITUDE_OPERATORS].sort((a, b) => b.monthlySorties - a.monthlySorties),
-)
-
-const trendMax = computed(() =>
-  Math.max(...FLIGHT_TRENDS.map((point) => Math.max(point.sorties, point.approvals, point.alerts * 10)), 1),
-)
-
-const selectedPosition = computed(() => {
-  const mission = selectedMission.value
-  return mission ? interpolateRoute(mission.route, mission.progress) : undefined
-})
-
-const kpis = computed(() => {
-  const missions = runtimeMissions.value
-  return {
-    running: missions.filter((mission) => mission.status === 'running').length,
-    warning: missions.filter((mission) => mission.status === 'warning').length,
-    planned: missions.filter((mission) => mission.status === 'planned').length,
-    aircraft: missions.filter((mission) => mission.status !== 'completed').length,
-    zones: AIRSPACE_ZONES.length,
-    approvals: FLIGHT_PLAN_APPROVALS.filter((approval) => approval.status !== 'approved').length,
-  }
-})
-
-const activeKpis = computed(() => {
-  const highRisks = RISK_EVENTS.filter((event) => event.level === 'high').length
-  const pendingApprovals = FLIGHT_PLAN_APPROVALS.filter((approval) => approval.status === 'pending').length
-  const recheckApprovals = FLIGHT_PLAN_APPROVALS.filter((approval) => approval.status === 'recheck').length
-  const approvedPlans = FLIGHT_PLAN_APPROVALS.filter((approval) => approval.status === 'approved').length
-  const noFlyZones = AIRSPACE_ZONES.filter((zone) => zone.type === 'no-fly' || zone.type === 'restricted').length
-  const corridorZones = AIRSPACE_ZONES.filter((zone) => zone.type === 'corridor').length
-
-  if (activeModule.value === 'airspace') {
-    return [
-      { label: '空域单元', value: AIRSPACE_ZONES.length },
-      { label: '航路走廊', value: corridorZones },
-      { label: '禁限飞区', value: noFlyZones, tone: 'warn' },
-      { label: '起降设施', value: LOW_ALTITUDE_FACILITIES.length },
-      { label: '设施可用', value: `${facilityAvailabilityRate.value}%` },
-      { label: '网格级别', value: `L${activeLevel.value}` },
-    ]
-  }
-
-  if (activeModule.value === 'approval') {
-    return [
-      { label: '待审批', value: pendingApprovals, tone: 'warn' },
-      { label: '需复核', value: recheckApprovals, tone: 'warn' },
-      { label: '已放行', value: approvedPlans },
-      { label: '高风险', value: highRisks, tone: 'warn' },
-      { label: '服务席位', value: serviceSeats.length },
-      { label: '平均耗时', value: '7.6m' },
-    ]
-  }
-
-  if (activeModule.value === 'industry') {
-    return [
-      { label: '月保障架次', value: operatorSummary.value.sorties },
-      { label: '运营主体', value: LOW_ALTITUDE_OPERATORS.length },
-      { label: '注册装备', value: operatorSummary.value.aircraft },
-      { label: '平均合规', value: `${averageCompliance.value}%` },
-      { label: '基础设施', value: LOW_ALTITUDE_FACILITIES.length },
-      { label: '服务收入', value: '31.8万' },
-    ]
-  }
-
-  return [
-    { label: '运行任务', value: kpis.value.running },
-    { label: '风险告警', value: kpis.value.warning, tone: 'warn' },
-    { label: '待飞计划', value: kpis.value.planned },
-    { label: '在线航空器', value: operatorSummary.value.online },
-    { label: '高风险点', value: highRisks, tone: 'warn' },
-    { label: '有效级别', value: `L${activeLevel.value}` },
-  ]
-})
-
-const scenarioStats = computed(() =>
-  SCENARIOS.map((scenario) => {
-    const missions = runtimeMissions.value.filter((mission) => mission.scenario === scenario.id)
-    return {
-      ...scenario,
-      total: missions.length,
-      warning: missions.filter((mission) => mission.status === 'warning').length,
-      running: missions.filter((mission) => mission.status === 'running').length,
-    }
-  }),
-)
-
-const gridOverlays = computed<GridOverlayInput[]>(() => {
-  if (!showGridOverlay.value) return []
-  const overlays: GridOverlayInput[] = []
-
-  if (operationToggles.value.routes) {
-    for (const mission of filteredMissions.value) {
-      const radius = Math.max(140, Math.min(420, mission.influenceRadius * 0.55))
-      for (const point of sampleRoute(mission.route, 3)) {
-        overlays.push({
-          lonDeg: point.lon,
-          latDeg: point.lat,
-          heightMeters: point.height,
-          radiusMeters: radius,
-          kind: mission.scenario === 'emergency' ? 'emergency' : 'route',
-        })
-      }
-    }
-  }
-
-  if (operationToggles.value.zones) {
-    for (const zone of visibleZones.value) {
-      const midHeight = (zone.heightRange.min + zone.heightRange.max) / 2
-      const radius = zone.radiusMeters ?? zoneRadius(zone)
-      overlays.push({
-        lonDeg: zone.center.lon,
-        latDeg: zone.center.lat,
-        heightMeters: midHeight,
-        radiusMeters: radius,
-        kind: zoneKind(zone),
-      })
-    }
-  }
-
-  if (operationToggles.value.risks) {
-    for (const event of visibleRisks.value) {
-      overlays.push({
-        lonDeg: event.lon,
-        latDeg: event.lat,
-        heightMeters: event.height,
-        radiusMeters: event.level === 'high' ? 540 : 360,
-        kind: event.level === 'high' ? 'risk-high' : 'risk-medium',
-      })
-    }
-  }
-
-  return overlays
-})
-
-const fmtPercent = (v: number): string => `${v}%`
-const fmtCoord = (v: number): string => v.toFixed(6)
-const fmtHeight = (v: number): string => `${v.toFixed(0)} m`
-
-const selectScenario = (scenario: ScenarioFilter): void => {
-  activeScenario.value = scenario
+const SCENARIO_NAME: Record<ScenarioId, string> = {
+  sub: '空域剖分',
+  iso: '网格隔离',
+  cor: '航路时窗',
+  trk: '实时航迹',
 }
 
-const selectMission = (id: string): void => {
-  selectedMissionId.value = id
-  const mission = runtimeMissions.value.find((item) => item.id === id)
-  if (mission) {
-    const point = interpolateRoute(mission.route, mission.progress)
-    flyToPoint(point.lon, point.lat, point.height, 5200, 0.8)
+const activeScenario = ref<ScenarioId>('sub')
+
+// ──────────────────────────────────────────────
+// 共享渲染状态
+// ──────────────────────────────────────────────
+const renderMode = ref<'wire' | 'fill'>('wire')
+const fillOpacity = ref(40) // 0..100，传引擎 /100
+const levelMode = ref<number | 'auto'>('auto') // 'auto' → setLevelOverride(undefined)
+const activeLevel = ref(5) // 由 getActiveLevel() 轮询刷新
+const showBoundary = ref(true)
+const cursor = ref<CursorReadout | undefined>()
+const pinnedGrids = ref<PickedGridInfo[]>([]) // 拾取钉入，最多 8 条
+const lastPick = ref<PickedGridInfo | undefined>()
+
+// 共享 watcher
+watch(renderMode, (m) => setMode(m))
+watch(fillOpacity, (v) => setFillOpacity(v / 100))
+watch(levelMode, (v) => setLevelOverride(v === 'auto' ? undefined : v))
+watch(showBoundary, (v) => setBoundaryVisible(v))
+
+// 单格边长查表（UI 展示用，索引 = level）
+const CELL_SIZE_LABEL: (string | null)[] = [
+  null, '~110km', '~28km', '~6.9km', '~1.7km', '~430m', '~110m', '~27m', '~6.7m', '~1.7m', '~42cm',
+]
+const cellSizeLabel = computed(() => CELL_SIZE_LABEL[activeLevel.value] ?? '—')
+
+const LEVELS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] as const
+
+// ──────────────────────────────────────────────
+// 拾取 / 钉入
+// ──────────────────────────────────────────────
+const togglePin = (info: PickedGridInfo): void => {
+  const idx = pinnedGrids.value.findIndex((g) => g.code3D === info.code3D)
+  if (idx >= 0) {
+    pinnedGrids.value = pinnedGrids.value.filter((_, i) => i !== idx)
+    return
   }
+  pinnedGrids.value = [info, ...pinnedGrids.value].slice(0, 8)
 }
-
-const togglePlay = (): void => {
-  isPlaying.value = !isPlaying.value
+const removePin = (code3D: string): void => {
+  pinnedGrids.value = pinnedGrids.value.filter((g) => g.code3D !== code3D)
 }
-
-const replaySelectedMission = (): void => {
-  const mission = selectedMission.value
-  if (!mission) return
-  missionProgress.value = { ...missionProgress.value, [mission.id]: 0 }
-  isPlaying.value = true
-}
-
-const onModeChange = (mode: FieldMode): void => {
-  renderMode.value = mode
-  setMode(mode)
-}
-
-const onFillOpacityChange = (v: number): void => {
-  setFillOpacity(v / 100)
-}
-
-const onLevelChange = (v: number | 'auto'): void => {
-  levelMode.value = v
-  setLevelOverride(v === 'auto' ? undefined : v)
-}
-
-const onClearSelections = (): void => {
+const clearPicks = (): void => {
   clearSelections()
-  pickedGrid.value = undefined
+  pinnedGrids.value = []
+  lastPick.value = undefined
 }
 
-const refreshOperationalMap = (): void => {
-  if (!mapReady.value) return
-  setBoundaryVisible(showBoundary.value)
-  setOperationOverlays({
-    missions: filteredMissions.value,
-    zones: visibleZones.value,
-    risks: visibleRisks.value,
-    facilities: visibleFacilities.value,
-    activeMissionId: selectedMission.value?.id,
-    toggles: operationToggles.value,
-  })
-
-  if (showGridOverlay.value) {
-    setGridOverlays(gridOverlays.value)
-  } else {
-    clearGridOverlays()
-  }
-
-  const point = selectedPosition.value
-  const mission = selectedMission.value
-  if (point && mission && operationToggles.value.aircraft) {
-    setActiveMissionInfluence(point.lon, point.lat, point.height, mission.influenceRadius)
-  } else {
-    clearActiveMissionInfluence()
-  }
-}
-
-const zoneKind = (zone: AirspaceZone): GridOverlayInput['kind'] => {
-  if (zone.type === 'no-fly') return 'no-fly'
-  if (zone.type === 'restricted') return 'restricted'
-  if (zone.type === 'emergency') return 'emergency'
-  if (zone.type === 'corridor') return 'corridor'
-  return 'route'
-}
-
-const zoneRadius = (zone: AirspaceZone): number => {
-  if (!zone.polygon || zone.polygon.length === 0) return 420
-  const lonSpan = Math.max(...zone.polygon.map((point) => point.lon)) - Math.min(...zone.polygon.map((point) => point.lon))
-  const latSpan = Math.max(...zone.polygon.map((point) => point.lat)) - Math.min(...zone.polygon.map((point) => point.lat))
-  return Math.min(1800, Math.max(420, Math.hypot(lonSpan * 102000, latSpan * 111320) / 3))
-}
-
-const zoneTypeLabel = (type: AirspaceZone['type']): string => {
-  const labels: Record<AirspaceZone['type'], string> = {
-    corridor: '低空航路',
-    takeoff: '起飞点',
-    landing: '备降点',
-    'no-fly': '禁飞区',
-    restricted: '限飞区',
-    emergency: '临时管制',
-  }
-  return labels[type]
-}
-
-const flyToZone = (zone: AirspaceZone): void => {
-  flyToPoint(zone.center.lon, zone.center.lat, (zone.heightRange.min + zone.heightRange.max) / 2, 6200, 0.75)
-}
-
-const flyToFacility = (facility: LowAltitudeFacility): void => {
-  flyToPoint(facility.lon, facility.lat, 0, 4200, 0.75)
-}
-
-const applyModulePreset = (module: ModuleId): void => {
-  const preset = moduleLayerPresets[module]
-  operationToggles.value = {
-    routes: preset.routes,
-    zones: preset.zones,
-    risks: preset.risks,
-    aircraft: preset.aircraft,
-    sites: preset.sites,
-  }
-  showGridOverlay.value = preset.grid
-  renderMode.value = preset.mode
-  fillOpacity.value = preset.opacity
-  setMode(preset.mode)
-  setFillOpacity(preset.opacity / 100)
-}
-
-const statusClass = (status: LowAltitudeMission['status']): string => `status--${status}`
-const priorityClass = (priority: LowAltitudeMission['priority']): string => `priority--${priority}`
-const riskClass = (level: RiskEvent['level']): string => `risk--${level}`
-
-watch(activeScenario, () => {
-  if (!filteredMissions.value.some((mission) => mission.id === selectedMissionId.value)) {
-    selectedMissionId.value = filteredMissions.value[0]?.id ?? LOW_ALTITUDE_MISSIONS[0]!.id
-  }
-})
-
-watch(activeModule, (module) => {
-  modulePanelOpen.value = false
-  applyModulePreset(module)
-})
-
-watch(
-  [
-    filteredMissions,
-    visibleZones,
-    visibleRisks,
-    visibleFacilities,
-    selectedMission,
-    selectedPosition,
-    operationToggles,
-    showBoundary,
-    showGridOverlay,
-    gridOverlays,
-  ],
-  refreshOperationalMap,
-  { deep: true },
+// 签名 HUD：光标网格读数
+const cursorCode = computed(() =>
+  cursor.value
+    ? codeAt(
+        cursor.value.lonDeg,
+        cursor.value.latDeg,
+        Math.max(0, cursor.value.heightMeters),
+        activeLevel.value,
+      )
+    : undefined,
 )
+
+// ──────────────────────────────────────────────
+// 格式化工具
+// ──────────────────────────────────────────────
+const fmtLon = (v: number): string => `${Math.abs(v).toFixed(5)}°${v >= 0 ? 'E' : 'W'}`
+const fmtLat = (v: number): string => `${Math.abs(v).toFixed(5)}°${v >= 0 ? 'N' : 'S'}`
+const fmtH = (v: number): string => `${v.toFixed(1)} m`
+
+const clock = ref('--:--:--')
+const formatClock = (): string => {
+  const d = new Date()
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+// ──────────────────────────────────────────────
+// 场景②：网格隔离
+// ──────────────────────────────────────────────
+interface Obstacle {
+  id: string
+  name: string
+  kind: 'building' | 'tower' | 'school' | 'fuel' | 'airport'
+  lon: number
+  lat: number
+  baseHeight: number
+  topHeight: number
+  radius: number
+  level: number
+  overlayKind: 'no-fly' | 'restricted'
+}
+const OBSTACLE_KIND_LABEL: Record<Obstacle['kind'], string> = {
+  building: '高层建筑',
+  tower: '通信铁塔',
+  school: '学校',
+  fuel: '加油加气',
+  airport: '机场净空',
+}
+const OBSTACLES: Obstacle[] = [
+  { id: 'obs-tower', name: '思茅广电发射铁塔', kind: 'tower', lon: 100.974, lat: 22.786, baseHeight: 0, topHeight: 220, radius: 90, level: 6, overlayKind: 'no-fly' },
+  { id: 'obs-build', name: '城区高层建筑群', kind: 'building', lon: 100.99, lat: 22.776, baseHeight: 0, topHeight: 160, radius: 160, level: 5, overlayKind: 'restricted' },
+  { id: 'obs-school', name: '思茅第一中学', kind: 'school', lon: 100.968, lat: 22.77, baseHeight: 0, topHeight: 120, radius: 200, level: 5, overlayKind: 'restricted' },
+  { id: 'obs-fuel', name: '城南加油加气站', kind: 'fuel', lon: 101.004, lat: 22.764, baseHeight: 0, topHeight: 100, radius: 140, level: 6, overlayKind: 'no-fly' },
+  { id: 'obs-airport', name: '机场净空保护区', kind: 'airport', lon: 100.958, lat: 22.793, baseHeight: 0, topHeight: 600, radius: 1500, level: 4, overlayKind: 'no-fly' },
+]
+const activeObstacles = ref<Set<string>>(new Set(OBSTACLES.map((o) => o.id)))
+const isolationStats = ref<Record<string, number>>({})
+
+const applyIsolation = (): void => {
+  const overlays: GridOverlayInput[] = []
+  const stats: Record<string, number> = {}
+  for (const obs of OBSTACLES) {
+    if (!activeObstacles.value.has(obs.id)) continue
+    const cells = isolationCells(obs.lon, obs.lat, obs.baseHeight, obs.topHeight, obs.radius, obs.level)
+    stats[obs.id] = cells.length
+    for (const c of cells) {
+      overlays.push({
+        lonDeg: c.lonDeg,
+        latDeg: c.latDeg,
+        heightMeters: c.heightMeters,
+        radiusMeters: 1,
+        kind: obs.overlayKind,
+      })
+    }
+  }
+  isolationStats.value = stats
+  setGridOverlays(overlays)
+}
+const toggleObstacle = (id: string): void => {
+  const next = new Set(activeObstacles.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  activeObstacles.value = next
+  if (activeScenario.value === 'iso') applyIsolation()
+}
+const focusObstacle = (obs: Obstacle): void => {
+  flyToPoint(obs.lon, obs.lat, obs.topHeight, 3200, 1.2)
+}
+const isolationTotal = computed(() =>
+  OBSTACLES.reduce(
+    (sum, o) => (activeObstacles.value.has(o.id) ? sum + (isolationStats.value[o.id] ?? 0) : sum),
+    0,
+  ),
+)
+
+// ──────────────────────────────────────────────
+// 场景③：航路时窗
+// ──────────────────────────────────────────────
+interface FlightPlan {
+  id: string
+  name: string
+  mission: LowAltitudeMission
+  speedMps: number
+  startSec: number
+  level: number
+  color: string
+}
+const flightPlans = ref<FlightPlan[]>(
+  LOW_ALTITUDE_MISSIONS.slice(0, 3).map((m, i) => ({
+    id: m.id,
+    name: m.name,
+    mission: m,
+    speedMps: m.aircraftType === 'helicopter' ? 28 : m.aircraftType === 'evtol' ? 36 : 16,
+    startSec: i * 90,
+    level: 6,
+    color: scenarioById(m.scenario).color,
+  })),
+)
+const selectedPlanId = ref(flightPlans.value[0]?.id ?? '')
+const corridorLevel = ref(6)
+const CORRIDOR_LEVELS = [5, 6, 7] as const
+
+const planSequences = computed<Record<string, TimeWindowCell[]>>(() =>
+  Object.fromEntries(
+    flightPlans.value.map((p) => {
+      const cells = gridifyRoute(p.mission.route, corridorLevel.value, 7)
+      return [p.id, assignTimeWindows(cells, p.mission.route, p.speedMps, p.startSec)]
+    }),
+  ),
+)
+const conflicts = computed<GridConflict[]>(() =>
+  detectConflicts(
+    flightPlans.value.map((p) => ({ planId: p.id, cells: planSequences.value[p.id] ?? [] })),
+    1800,
+  ),
+)
+const conflictCodeSet = computed(() => new Set(conflicts.value.map((c) => c.code3D)))
+const selectedPlan = computed(() => flightPlans.value.find((p) => p.id === selectedPlanId.value))
+const selectedSequence = computed<TimeWindowCell[]>(
+  () => planSequences.value[selectedPlanId.value] ?? [],
+)
+
+const planCellCount = (id: string): number => planSequences.value[id]?.length ?? 0
+const planNameById = (id: string): string => flightPlans.value.find((p) => p.id === id)?.name ?? id
+
+const selectedRouteKm = computed(() =>
+  selectedPlan.value ? routeLengthMeters(selectedPlan.value.mission.route) / 1000 : 0,
+)
+const selectedDurationSec = computed(() => {
+  const seq = selectedSequence.value
+  if (seq.length === 0) return 0
+  return (seq[seq.length - 1]!.exitSec) - (seq[0]!.enterSec)
+})
+
+const applyCorridor = (): void => {
+  const overlays: GridOverlayInput[] = []
+  const conflictCodes = conflictCodeSet.value
+  for (const plan of flightPlans.value) {
+    for (const cell of planSequences.value[plan.id] ?? []) {
+      overlays.push({
+        lonDeg: cell.lonDeg,
+        latDeg: cell.latDeg,
+        heightMeters: cell.heightMeters,
+        radiusMeters: 1,
+        kind: conflictCodes.has(cell.code3D) ? 'risk-high' : 'corridor',
+      })
+    }
+  }
+  setGridOverlays(overlays)
+}
+watch([corridorLevel, conflicts], () => {
+  if (activeScenario.value === 'cor') applyCorridor()
+})
+
+const focusPlan = (plan: FlightPlan): void => {
+  selectedPlanId.value = plan.id
+  const start = plan.mission.route[0]
+  if (start) flyToPoint(start.lon, start.lat, start.height, 4200, 1.2)
+}
+
+// ──────────────────────────────────────────────
+// 场景④：实时航迹
+// ──────────────────────────────────────────────
+type TrackAircraft = 'micro' | 'small' | 'large'
+const aircraftSizes: Record<TrackAircraft, { label: string; size: number; radius: number; alt: number }> = {
+  micro: { label: '微型无人机', size: 0.4, radius: 120, alt: 90 },
+  small: { label: '小型无人机', size: 3, radius: 240, alt: 150 },
+  large: { label: '大型无人机/eVTOL', size: 12, radius: 420, alt: 220 },
+}
+const TRACK_ORDER: TrackAircraft[] = ['micro', 'small', 'large']
+const trackAircraft = ref<TrackAircraft>('small')
+const droneFlying = ref(false)
+const trackLevel = computed(() => levelForAircraftSize(aircraftSizes[trackAircraft.value].size))
+
+const applyDroneConfig = (): void => {
+  const a = aircraftSizes[trackAircraft.value]
+  setDroneAltitude(a.alt)
+  setDroneInfluenceRadius(a.radius)
+  setDroneOrbitRadius(a.radius * 3.2)
+  setDroneSpeed(0.18)
+  setLevelOverride(trackLevel.value)
+  levelMode.value = trackLevel.value
+}
+const selectAircraft = (t: TrackAircraft): void => {
+  if (trackAircraft.value === t) return
+  trackAircraft.value = t
+  if (droneFlying.value) applyDroneConfig()
+}
+const toggleDrone = (): void => {
+  if (droneFlying.value) {
+    stopDrone()
+    droneFlying.value = false
+    return
+  }
+  applyDroneConfig()
+  startDrone(SIMAO_OPERATION_CENTER.lon, SIMAO_OPERATION_CENTER.lat)
+  droneFlying.value = true
+}
+
+// ──────────────────────────────────────────────
+// 场景编排
+// ──────────────────────────────────────────────
+const applyScenario = (id: ScenarioId): void => {
+  // 复位共享渲染状态
+  clearGridOverlays()
+  clearActiveMissionInfluence()
+  if (isDroneRunning()) {
+    stopDrone()
+    droneFlying.value = false
+  }
+
+  if (id === 'sub') {
+    setMode(renderMode.value)
+    setGivenRange(NaN, NaN, NaN, NaN)
+  } else if (id === 'iso') {
+    renderMode.value = 'fill'
+    setMode('fill')
+    setFillOpacity(fillOpacity.value / 100)
+    applyIsolation()
+  } else if (id === 'cor') {
+    renderMode.value = 'fill'
+    setMode('fill')
+    setFillOpacity(fillOpacity.value / 100)
+    applyCorridor()
+  } else if (id === 'trk') {
+    renderMode.value = 'wire'
+    setMode('wire')
+  }
+}
+const selectScenario = (id: ScenarioId): void => {
+  if (id === activeScenario.value) return
+  activeScenario.value = id
+  pinnedGrids.value = []
+  lastPick.value = undefined
+  applyScenario(id)
+}
+
+// 区域快捷定位
+const flyUrbanCenter = (): void => {
+  flyToPoint(SIMAO_OPERATION_CENTER.lon, SIMAO_OPERATION_CENTER.lat, 0, 6000, 1.2)
+}
+const flyDistrict = (): void => {
+  flyToBBox(SIMAO_BBOX.west, SIMAO_BBOX.south, SIMAO_BBOX.east, SIMAO_BBOX.north, 1.4)
+}
+
+// ──────────────────────────────────────────────
+// 状态条派生
+// ──────────────────────────────────────────────
+const levelText = computed(() => (levelMode.value === 'auto' ? `AUTO·L${activeLevel.value}` : `L${activeLevel.value}`))
+const modeText = computed(() => (renderMode.value === 'fill' ? '填充' : '线框'))
+
+// ──────────────────────────────────────────────
+// 生命周期
+// ──────────────────────────────────────────────
+const mapRef = ref<HTMLDivElement | null>(null)
+let clockTimer: number | undefined
+let levelTimer: number | undefined
+let unGridPick: (() => void) | undefined
+let unCursor: (() => void) | undefined
 
 onMounted(async () => {
-  if (!container.value) return
-
-  init(container.value, {
-    heightRange: { min: 0, max: 720, step: 120 },
-    anchorLonDeg: SIMAO_OPERATION_CENTER.lon,
-    anchorLatDeg: SIMAO_OPERATION_CENTER.lat,
+  const el = mapRef.value
+  if (!el) return
+  init(el)
+  unGridPick = onGridPick((info) => {
+    lastPick.value = info
+    if (info) togglePin(info)
   })
-  mapReady.value = true
-  offGridPick = onGridPick((info) => {
-    pickedGrid.value = info
+  unCursor = onCursorReadout((r) => {
+    cursor.value = r
   })
-
   setMode(renderMode.value)
   setFillOpacity(fillOpacity.value / 100)
-  setLevelOverride(typeof levelMode.value === 'number' ? levelMode.value : undefined)
-  setGivenRange(SIMAO_BBOX.west, SIMAO_BBOX.south, SIMAO_BBOX.east, SIMAO_BBOX.north)
-
-  loadBoundary(SIMAO_DISTRICT_BOUNDARY_URL, { flyTo: false }).catch(() => {
-    /* 边界加载失败不阻断主流程。 */
-  })
-
-  refreshOperationalMap()
-
+  setLevelOverride(undefined)
+  await loadBoundary(SIMAO_DISTRICT_BOUNDARY_URL, { flyTo: false }).catch(() => {})
+  setBoundaryVisible(showBoundary.value)
+  applyScenario(activeScenario.value)
+  clock.value = formatClock()
+  clockTimer = window.setInterval(() => {
+    clock.value = formatClock()
+  }, 1000)
   levelTimer = window.setInterval(() => {
     activeLevel.value = getActiveLevel()
-  }, 400)
-
-  playTimer = window.setInterval(() => {
-    if (!isPlaying.value) return
-    const next = { ...missionProgress.value }
-    const selectedId = selectedMission.value?.id
-    for (const mission of LOW_ALTITUDE_MISSIONS) {
-      const shouldAdvance = mission.status === 'running' || mission.status === 'warning' || mission.id === selectedId
-      if (!shouldAdvance) continue
-      const current = next[mission.id] ?? mission.progress
-      if (current >= 100 && mission.id !== selectedId) continue
-      next[mission.id] = current >= 100 ? 0 : Math.min(100, current + 2.4)
-    }
-    missionProgress.value = next
-  }, 900)
+  }, 500)
 })
 
 onBeforeUnmount(() => {
-  if (levelTimer !== undefined) {
-    window.clearInterval(levelTimer)
-    levelTimer = undefined
-  }
-  if (playTimer !== undefined) {
-    window.clearInterval(playTimer)
-    playTimer = undefined
-  }
-  offGridPick?.()
-  offGridPick = undefined
+  if (clockTimer) clearInterval(clockTimer)
+  if (levelTimer) clearInterval(levelTimer)
+  unGridPick?.()
+  unCursor?.()
   dispose()
 })
 </script>
 
 <template>
-  <div class="workspace" :class="`workspace--${activeModule}`">
-    <div ref="container" class="cesium-container"></div>
+  <div class="console">
+    <!-- 作战图（Cesium 容器，铺满，主角） -->
+    <div ref="mapRef" class="map"></div>
 
+    <!-- 顶栏 -->
     <header class="topbar">
       <div class="brand">
-        <span class="brand__mark"></span>
-        <div>
-          <h1>思茅区低空经济综合运营监管平台</h1>
-          <p>{{ activeModuleProfile.title }} · {{ activeModuleProfile.subtitle }}</p>
-        </div>
-        <span class="brand__badge">{{ activeModuleProfile.badge }}</span>
+        <span class="brand-mark">北斗网格</span>
+        <span class="brand-sub">低空空域管制台</span>
       </div>
-      <nav class="module-tabs" aria-label="平台模块">
+      <nav class="tabs">
         <button
-          v-for="module in moduleTabs"
-          :key="module.id"
+          v-for="tab in SCENARIO_TABS"
+          :key="tab.id"
+          class="tab"
+          :class="{ active: activeScenario === tab.id }"
           type="button"
-          class="module-tab"
-          :class="{ 'module-tab--active': activeModule === module.id }"
-          @click="activeModule = module.id"
+          @click="selectScenario(tab.id)"
         >
-          <span class="module-tab__label">{{ module.label }}</span>
-          <span class="module-tab__sub">{{ moduleProfiles[module.id].badge }}</span>
+          <span class="tab-code">{{ tab.code }}</span>
+          <span class="tab-name">{{ tab.name }}</span>
         </button>
       </nav>
-      <div class="kpis">
-        <div v-for="item in activeKpis" :key="item.label" class="kpi" :class="{ 'kpi--warn': item.tone === 'warn' }">
-          <span>{{ item.label }}</span>
-          <strong>{{ item.value }}</strong>
+      <div class="topbar-right">
+        <div class="region-btns">
+          <button class="region-btn" type="button" @click="flyUrbanCenter">主城区</button>
+          <button class="region-btn" type="button" @click="flyDistrict">全域</button>
         </div>
+        <div class="clock mono">{{ clock }}</div>
       </div>
     </header>
 
-    <section class="module-banner panel-shell">
-      <span>{{ activeModuleProfile.badge }}</span>
-      <strong>{{ activeModuleProfile.title }}</strong>
-      <em>{{ activeModuleProfile.subtitle }}</em>
-      <button type="button" class="module-panel-trigger" @click="modulePanelOpen = true">查看详情</button>
-    </section>
-
-    <el-dialog
-      v-model="modulePanelOpen"
-      append-to-body
-      class="module-dialog"
-      width="72vw"
-      :close-on-click-modal="true"
-      :show-close="true"
-    >
-      <template #header>
-        <div class="module-dialog__head">
-          <span>{{ activeModuleProfile.badge }}</span>
-          <strong>{{ activeModuleProfile.title }}</strong>
-          <em>{{ activeModuleProfile.subtitle }}</em>
-        </div>
-      </template>
-      <section class="module-focus-content">
-      <template v-if="activeModule === 'overview'">
-        <div class="focus-head">
-          <span>运行值守</span>
-          <strong>实时飞行、风险、席位联动</strong>
-        </div>
-        <div class="overview-command-grid">
-          <div class="command-card command-card--primary">
-            <span>当前指挥对象</span>
-            <strong>{{ selectedMission?.name }}</strong>
-            <em>{{ selectedMission ? `${scenarioById(selectedMission.scenario).name} · ${selectedMission.operator}` : '暂无任务' }}</em>
-            <i v-if="selectedMission"><b :style="{ width: `${selectedMission.progress}%` }"></b></i>
+    <!-- 左作业栏 -->
+    <aside class="rail rail-left">
+      <!-- 场景①：空域剖分 -->
+      <template v-if="activeScenario === 'sub'">
+        <section class="panel">
+          <div class="panel-head">
+            <span class="panel-title">剖分级别</span>
+            <span class="panel-tag mono">L{{ activeLevel }}</span>
           </div>
-          <div class="seat-board">
-            <div v-for="seat in overviewDutyBoard" :key="seat.seat" class="seat-row">
-              <b :class="{ 'seat-row__state--warn': seat.status === '关注' }">{{ seat.status }}</b>
-              <span>
-                <strong>{{ seat.seat }}</strong>
-                <em>{{ seat.focus }}</em>
-              </span>
-            </div>
-          </div>
-          <div class="event-stream">
-            <div v-for="notice in OPERATION_NOTICES.slice(0, 3)" :key="notice.id" class="event-stream__item" :class="`notice--${notice.level}`">
-              <strong>{{ notice.time }}</strong>
-              <span>{{ notice.title }}</span>
-            </div>
-          </div>
-        </div>
-      </template>
-
-      <template v-else-if="activeModule === 'airspace'">
-        <div class="focus-head">
-          <span>空域资源</span>
-          <strong>分层、分类、分格管理</strong>
-        </div>
-        <div class="airspace-work-grid">
-          <div class="airspace-profile">
-            <div v-for="band in altitudeBands" :key="band.label" class="airspace-lane">
-              <span>
-                <strong>{{ band.label }}</strong>
-                <em>{{ band.name }}</em>
-              </span>
-              <i><b :style="{ width: `${band.load}%` }"></b></i>
-              <small>{{ band.load }}%</small>
-            </div>
-          </div>
-          <div class="grid-ledger">
-            <div v-for="item in airspaceGridLedger" :key="item.name" class="ledger-row">
-              <span>
-                <strong>{{ item.name }}</strong>
-                <em>{{ item.level }} · {{ item.owner }}</em>
-              </span>
-              <b>{{ item.capacity }}%</b>
-            </div>
-          </div>
-          <div class="airspace-policy">
-            <div v-for="rule in airspaceRuleCards" :key="rule.title" class="policy-pill">
-              <strong>{{ rule.title }}</strong>
-              <span>{{ rule.detail }}</span>
-            </div>
-          </div>
-        </div>
-      </template>
-
-      <template v-else-if="activeModule === 'approval'">
-        <div class="focus-head">
-          <span>审批工单</span>
-          <strong>申请要素、规则校核、席位放行</strong>
-        </div>
-        <div class="approval-work-grid">
-          <div class="approval-case-card">
-            <span>当前复核计划</span>
-            <strong>{{ approvalQueue[0]?.routeName ?? '暂无计划' }}</strong>
-            <em>{{ approvalQueue[0]?.applicant }} · {{ approvalQueue[0]?.window }}</em>
-            <i v-if="approvalQueue[0]"><b :style="{ width: `${approvalQueue[0].riskScore}%` }"></b></i>
-          </div>
-          <div class="compliance-list">
-            <div v-for="check in approvalChecklist" :key="check.item" class="compliance-row">
-              <b :class="{ 'compliance-row__state--warn': check.state !== '已核验' }">{{ check.state }}</b>
-              <span>
-                <strong>{{ check.item }}</strong>
-                <em>{{ check.owner }}</em>
-              </span>
-            </div>
-          </div>
-          <div class="decision-rules">
-            <div v-for="rule in approvalDecisionRules" :key="rule.title" class="decision-rule">
-              <strong>{{ rule.title }}</strong>
-              <span>{{ rule.detail }}</span>
-            </div>
-          </div>
-        </div>
-      </template>
-
-      <template v-else>
-        <div class="focus-head">
-          <span>产业画像</span>
-          <strong>场景价值、主体能力、设施覆盖</strong>
-        </div>
-        <div class="industry-work-grid">
-          <div class="scenario-portfolio">
-            <div v-for="item in industryScenarioCards" :key="item.scenario" class="portfolio-row">
-              <span>
-                <strong>{{ scenarioById(item.scenario).shortName }}</strong>
-                <em>{{ item.focus }} · {{ item.value }}</em>
-              </span>
-              <i><b :style="{ width: `${item.maturity}%`, background: scenarioById(item.scenario).color }"></b></i>
-              <small>{{ item.maturity }}</small>
-            </div>
-          </div>
-          <div class="operator-rank">
-            <div v-for="operator in operatorRanking.slice(0, 4)" :key="operator.id" class="rank-row">
-              <span>
-                <strong>{{ operator.name }}</strong>
-                <em>{{ operatorTypeLabel(operator.type) }} · 合规 {{ operator.complianceRate }}%</em>
-              </span>
-              <b>{{ operator.monthlySorties }}</b>
-            </div>
-          </div>
-          <div class="facility-mosaic">
-            <div v-for="facility in LOW_ALTITUDE_FACILITIES" :key="facility.id" class="facility-chip">
-              <strong>{{ facilityTypeLabel(facility.type) }}</strong>
-              <span>{{ facility.available }}/{{ facility.capacity }}</span>
-            </div>
-          </div>
-        </div>
-      </template>
-      </section>
-    </el-dialog>
-
-    <aside class="left-rail panel-shell">
-      <template v-if="activeModule === 'overview'">
-        <section class="panel-section">
-          <div class="panel-title">应用场景</div>
-          <button
-            class="scenario-row"
-            :class="{ 'scenario-row--active': activeScenario === 'all' }"
-            type="button"
-            @click="selectScenario('all')"
-          >
-            <span class="scenario-row__dot scenario-row__dot--all"></span>
-            <span class="scenario-row__main">综合态势</span>
-            <span class="scenario-row__meta">{{ runtimeMissions.length }}</span>
-          </button>
-          <button
-            v-for="scenario in scenarioStats"
-            :key="scenario.id"
-            class="scenario-row"
-            :class="{ 'scenario-row--active': activeScenario === scenario.id }"
-            type="button"
-            @click="selectScenario(scenario.id)"
-          >
-            <span class="scenario-row__dot" :style="{ background: scenario.color }"></span>
-            <span class="scenario-row__main">{{ scenario.name }}</span>
-            <span class="scenario-row__meta">{{ scenario.running }}/{{ scenario.total }}</span>
-          </button>
-        </section>
-
-        <section class="panel-section">
-          <div class="panel-title">运行通告</div>
-          <div class="notice-list">
-            <div v-for="notice in OPERATION_NOTICES" :key="notice.id" class="notice-row" :class="`notice--${notice.level}`">
-              <span class="notice-row__time">{{ notice.time }}</span>
-              <span class="notice-row__body">
-                <strong>{{ notice.title }}</strong>
-                <em>{{ notice.source }}</em>
-              </span>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel-section panel-section--fill">
-          <div class="panel-title">任务调度</div>
-          <div class="mission-list">
+          <div class="seg seg-levels">
             <button
-              v-for="mission in filteredMissions"
-              :key="mission.id"
-              class="mission-row"
-              :class="{ 'mission-row--active': selectedMission?.id === mission.id }"
+              class="seg-btn"
+              :class="{ active: levelMode === 'auto' }"
               type="button"
-              @click="selectMission(mission.id)"
+              @click="levelMode = 'auto'"
             >
-              <span class="mission-row__head">
-                <span class="mission-row__name">{{ mission.name }}</span>
-                <span class="tag" :class="statusClass(mission.status)">{{ statusLabel(mission.status) }}</span>
-              </span>
-              <span class="mission-row__meta">
-                {{ scenarioById(mission.scenario).shortName }} · {{ aircraftLabel(mission.aircraftType) }} ·
-                {{ priorityLabel(mission.priority) }}
-              </span>
-              <span class="progress">
-                <span class="progress__bar" :style="{ width: `${mission.progress}%` }"></span>
-              </span>
+              AUTO
+            </button>
+            <button
+              v-for="lv in LEVELS"
+              :key="lv"
+              class="seg-btn mono"
+              :class="{ active: levelMode === lv }"
+              type="button"
+              @click="levelMode = lv"
+            >
+              L{{ lv }}
             </button>
           </div>
-        </section>
-      </template>
-
-      <template v-else-if="activeModule === 'airspace'">
-        <section class="panel-section">
-          <div class="panel-title">空域分类规则</div>
-          <div class="rule-grid">
-            <div v-for="rule in airspaceRuleCards" :key="rule.title" class="rule-card">
-              <strong>{{ rule.title }}</strong>
-              <span>{{ rule.detail }}</span>
-            </div>
-          </div>
+          <p class="panel-note">AUTO 模式下级别随地图比例尺联动；锁定后固定不变。</p>
         </section>
 
-        <section class="panel-section">
-          <div class="panel-title">高度层负载</div>
-          <div v-for="band in altitudeBands" :key="band.label" class="altitude-band">
-            <span>
-              <strong>{{ band.label }}</strong>
-              <em>{{ band.name }}</em>
-            </span>
-            <i><b :style="{ width: `${band.load}%` }"></b></i>
-            <small>{{ band.load }}%</small>
-          </div>
-        </section>
-
-        <section class="panel-section panel-section--fill">
-          <div class="panel-title">资源单元目录</div>
-          <div class="zone-list">
-            <button v-for="zone in visibleZones" :key="zone.id" class="zone-row" type="button" @click="flyToZone(zone)">
-              <span class="zone-row__main">
-                <strong>{{ zone.name }}</strong>
-                <em>{{ zoneTypeLabel(zone.type) }} · {{ zone.heightRange.min }}-{{ zone.heightRange.max }}m</em>
-              </span>
-              <span class="tag">{{ zone.scenario ? scenarioById(zone.scenario).shortName : '全域' }}</span>
+        <section class="panel">
+          <div class="panel-head"><span class="panel-title">渲染</span></div>
+          <div class="seg">
+            <button
+              class="seg-btn"
+              :class="{ active: renderMode === 'wire' }"
+              type="button"
+              @click="renderMode = 'wire'"
+            >
+              线框
+            </button>
+            <button
+              class="seg-btn"
+              :class="{ active: renderMode === 'fill' }"
+              type="button"
+              @click="renderMode = 'fill'"
+            >
+              填充
             </button>
           </div>
+          <div v-if="renderMode === 'fill'" class="field">
+            <label class="field-label">
+              <span>不透明度</span>
+              <span class="mono">{{ fillOpacity }}%</span>
+            </label>
+            <input v-model.number="fillOpacity" class="slider" type="range" min="0" max="100" />
+          </div>
+          <label class="check">
+            <input v-model="showBoundary" type="checkbox" />
+            <span>显示行政边界</span>
+          </label>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><span class="panel-title">逐格拾取</span></div>
+          <p class="panel-note">单击作战图立方体循环改色，并钉入右栏读数。</p>
+          <dl class="ledger">
+            <div class="ledger-row">
+              <dt>当前级别</dt>
+              <dd class="mono">L{{ activeLevel }}</dd>
+            </div>
+            <div class="ledger-row">
+              <dt>单格边长</dt>
+              <dd class="mono">{{ cellSizeLabel }}</dd>
+            </div>
+            <div class="ledger-row">
+              <dt>已钉网格</dt>
+              <dd class="mono">{{ pinnedGrids.length }} / 8</dd>
+            </div>
+          </dl>
+          <button class="btn-line" type="button" @click="clearPicks">清空选中</button>
         </section>
       </template>
 
-      <template v-else-if="activeModule === 'approval'">
-        <section class="panel-section">
-          <div class="panel-title">计划查询项</div>
-          <div class="query-grid">
-            <span v-for="field in planQueryFields" :key="field">{{ field }}</span>
+      <!-- 场景②：网格隔离 -->
+      <template v-else-if="activeScenario === 'iso'">
+        <section class="panel">
+          <div class="panel-head"><span class="panel-title">渲染</span></div>
+          <div class="field">
+            <label class="field-label">
+              <span>填充不透明度</span>
+              <span class="mono">{{ fillOpacity }}%</span>
+            </label>
+            <input v-model.number="fillOpacity" class="slider" type="range" min="0" max="100" />
           </div>
         </section>
 
-        <section class="panel-section">
-          <div class="panel-title">审批闭环</div>
-          <div class="approval-stepper">
-            <div v-for="(step, index) in approvalSteps" :key="step.label" class="approval-step">
-              <b>{{ index + 1 }}</b>
-              <span>
-                <strong>{{ step.label }}</strong>
-                <em>{{ step.value }}</em>
-              </span>
-            </div>
+        <section class="panel panel-grow">
+          <div class="panel-head">
+            <span class="panel-title">隔离目标</span>
+            <span class="panel-tag mono">{{ activeObstacles.size }}/{{ OBSTACLES.length }}</span>
           </div>
+          <ul class="obstacle-list">
+            <li
+              v-for="obs in OBSTACLES"
+              :key="obs.id"
+              class="obstacle"
+              :class="{ off: !activeObstacles.has(obs.id) }"
+            >
+              <button
+                class="dot-toggle"
+                :class="obs.overlayKind === 'no-fly' ? 'is-nofly' : 'is-restricted'"
+                type="button"
+                :aria-pressed="activeObstacles.has(obs.id)"
+                @click="toggleObstacle(obs.id)"
+              ></button>
+              <div class="obstacle-body" @click="focusObstacle(obs)">
+                <div class="obstacle-top">
+                  <span class="obstacle-name">{{ obs.name }}</span>
+                  <span class="pill" :class="obs.overlayKind === 'no-fly' ? 'pill-nofly' : 'pill-restricted'">
+                    {{ obs.overlayKind === 'no-fly' ? '禁飞' : '限飞' }}
+                  </span>
+                </div>
+                <div class="obstacle-meta mono">
+                  {{ OBSTACLE_KIND_LABEL[obs.kind] }}·L{{ obs.level }}·{{ obs.topHeight }}m·{{ isolationStats[obs.id] ?? 0 }}格
+                </div>
+              </div>
+            </li>
+          </ul>
         </section>
 
-        <section class="panel-section panel-section--fill">
-          <div class="panel-title">飞行计划队列</div>
-          <div class="approval-list approval-list--scroll">
-            <div v-for="approval in approvalQueue" :key="approval.id" class="approval-row" :class="`approval--${approval.status}`">
-              <div class="approval-row__head">
-                <strong>{{ approval.routeName }}</strong>
-                <span>{{ approvalStatusLabel(approval.status) }}</span>
-              </div>
-              <p>{{ approval.applicant }} · {{ approval.window }}</p>
-              <div class="risk-score">
-                <span>风险评分</span>
-                <strong>{{ approval.riskScore }}</strong>
-                <i :style="{ width: `${approval.riskScore}%` }"></i>
-              </div>
+        <section class="panel">
+          <dl class="ledger">
+            <div class="ledger-row strong">
+              <dt>隔离网格合计</dt>
+              <dd class="mono phos">{{ isolationTotal }} 格</dd>
             </div>
+          </dl>
+        </section>
+      </template>
+
+      <!-- 场景③：航路时窗 -->
+      <template v-else-if="activeScenario === 'cor'">
+        <section class="panel">
+          <div class="panel-head"><span class="panel-title">航路网格级别</span></div>
+          <div class="seg">
+            <button
+              v-for="lv in CORRIDOR_LEVELS"
+              :key="lv"
+              class="seg-btn mono"
+              :class="{ active: corridorLevel === lv }"
+              type="button"
+              @click="corridorLevel = lv"
+            >
+              L{{ lv }}
+            </button>
+          </div>
+          <p class="panel-note">级别越高网格越细，时窗序列越密。</p>
+        </section>
+
+        <section class="panel panel-grow">
+          <div class="panel-head">
+            <span class="panel-title">飞行计划</span>
+            <span class="panel-tag mono">{{ flightPlans.length }}</span>
+          </div>
+          <ul class="plan-list">
+            <li
+              v-for="plan in flightPlans"
+              :key="plan.id"
+              class="plan"
+              :class="{ active: selectedPlanId === plan.id }"
+              @click="focusPlan(plan)"
+            >
+              <span class="plan-dot" :style="{ background: plan.color }"></span>
+              <div class="plan-body">
+                <div class="plan-name">{{ plan.name }}</div>
+                <div class="plan-meta mono">
+                  起飞+{{ plan.startSec }}·{{ plan.speedMps }}m/s·{{ planCellCount(plan.id) }}格
+                </div>
+              </div>
+            </li>
+          </ul>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><span class="panel-title">冲突检测</span></div>
+          <div v-if="conflicts.length === 0" class="verdict verdict-ok">
+            <span class="verdict-dot"></span>
+            <span>可放行 · 无同格同窗冲突</span>
+          </div>
+          <div v-else class="verdict verdict-bad">
+            <span class="verdict-dot"></span>
+            <span>{{ conflicts.length }} 处冲突需调整</span>
           </div>
         </section>
       </template>
 
+      <!-- 场景④：实时航迹 -->
       <template v-else>
-        <section class="panel-section">
-          <div class="panel-title">产业运行指标</div>
-          <div class="metric-grid">
-            <div v-for="metric in INDUSTRY_METRICS" :key="metric.label" :class="`industry-card industry-card--${metric.tone}`">
-              <span>{{ metric.label }}</span>
-              <strong>{{ metric.value }}</strong>
-              <em>{{ metric.delta }}</em>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel-section">
-          <div class="panel-title">产业链条</div>
-          <div class="chain-list">
-            <div v-for="item in industryChain" :key="item.label" class="chain-row">
-              <strong>{{ item.label }}</strong>
-              <span>{{ item.value }}</span>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel-section panel-section--fill">
-          <div class="panel-title">运营主体</div>
-          <div class="operator-list">
-            <div v-for="operator in LOW_ALTITUDE_OPERATORS" :key="operator.id" class="operator-row">
-              <span>
-                <strong>{{ operator.name }}</strong>
-                <em>{{ operatorTypeLabel(operator.type) }} · {{ operator.aircraft }}架 · {{ operator.pilots }}人</em>
+        <section class="panel">
+          <div class="panel-head"><span class="panel-title">机型 → 层级</span></div>
+          <div class="aircraft-list">
+            <button
+              v-for="key in TRACK_ORDER"
+              :key="key"
+              class="aircraft"
+              :class="{ active: trackAircraft === key }"
+              type="button"
+              @click="selectAircraft(key)"
+            >
+              <span class="aircraft-name">{{ aircraftSizes[key].label }}</span>
+              <span class="aircraft-map mono">
+                ≤{{ aircraftSizes[key].size }}m → L{{ levelForAircraftSize(aircraftSizes[key].size) }}
               </span>
-              <b>{{ operator.complianceRate }}%</b>
-            </div>
+            </button>
           </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><span class="panel-title">飞行模拟</span></div>
+          <button
+            class="btn-block"
+            :class="droneFlying ? 'is-stop' : 'is-go'"
+            type="button"
+            @click="toggleDrone"
+          >
+            {{ droneFlying ? '■ 降落' : '▶ 起飞' }}
+          </button>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head"><span class="panel-title">运行遥测</span></div>
+          <dl class="ledger">
+            <div class="ledger-row">
+              <dt>状态</dt>
+              <dd class="mono" :class="droneFlying ? 'phos' : ''">{{ droneFlying ? '巡航中' : '待命' }}</dd>
+            </div>
+            <div class="ledger-row">
+              <dt>所在格级别</dt>
+              <dd class="mono">L{{ trackLevel }}</dd>
+            </div>
+            <div class="ledger-row">
+              <dt>影响半径</dt>
+              <dd class="mono">{{ aircraftSizes[trackAircraft].radius }} m</dd>
+            </div>
+            <div class="ledger-row">
+              <dt>巡航高度</dt>
+              <dd class="mono">{{ aircraftSizes[trackAircraft].alt }} m</dd>
+            </div>
+          </dl>
         </section>
       </template>
     </aside>
 
-    <aside class="right-rail panel-shell">
-      <template v-if="activeModule === 'overview'">
-        <section v-if="selectedMission" class="panel-section">
-          <div class="panel-title">当前任务</div>
-          <div class="detail-head">
-            <div>
-              <h2>{{ selectedMission.name }}</h2>
-              <p>{{ selectedMission.operator }}</p>
-            </div>
-            <span class="tag" :class="priorityClass(selectedMission.priority)">
-              {{ priorityLabel(selectedMission.priority) }}
-            </span>
+    <!-- 右读数栏 -->
+    <aside class="rail rail-right">
+      <!-- 场景③：序列检视 -->
+      <template v-if="activeScenario === 'cor'">
+        <section class="panel">
+          <div class="panel-head">
+            <span class="panel-title">序列检视</span>
+            <span class="panel-tag">{{ selectedPlan?.name ?? '—' }}</span>
           </div>
-          <div class="detail-grid">
-            <div>
-              <span>场景</span>
-              <strong>{{ scenarioById(selectedMission.scenario).name }}</strong>
+          <dl class="ledger">
+            <div class="ledger-row">
+              <dt>航路长度</dt>
+              <dd class="mono">{{ selectedRouteKm.toFixed(2) }} km</dd>
             </div>
-            <div>
-              <span>航空器</span>
-              <strong>{{ aircraftLabel(selectedMission.aircraftType) }}</strong>
+            <div class="ledger-row">
+              <dt>网格数</dt>
+              <dd class="mono">{{ selectedSequence.length }}</dd>
             </div>
-            <div>
-              <span>载荷</span>
-              <strong>{{ selectedMission.payload }}</strong>
+            <div class="ledger-row">
+              <dt>总耗时</dt>
+              <dd class="mono">{{ formatRelSec(selectedDurationSec) }}</dd>
             </div>
-            <div>
-              <span>影响半径</span>
-              <strong>{{ selectedMission.influenceRadius }} m</strong>
-            </div>
-          </div>
-          <div class="mission-progress-line">
-            <span>任务进度</span>
-            <strong>{{ selectedMission.progress.toFixed(0) }}%</strong>
-          </div>
-          <el-progress :percentage="Math.round(selectedMission.progress)" :stroke-width="8" :show-text="false" />
+          </dl>
         </section>
 
-        <section class="panel-section">
-          <div class="panel-title">拾取网格编码</div>
-          <div v-if="pickedGrid" class="code-block">
-            <span>三维编码</span>
-            <code>{{ pickedGrid.code3D }}</code>
-            <span>二维编码</span>
-            <code>{{ pickedGrid.code2D }}</code>
-            <div class="code-meta">
-              <span>L{{ pickedGrid.level }}</span>
-              <span>
-                {{ fmtCoord(pickedGrid.center.lonDeg) }},
-                {{ fmtCoord(pickedGrid.center.latDeg) }},
-                {{ fmtHeight(pickedGrid.center.heightMeters) }}
-              </span>
+        <section class="panel panel-grow seq-panel">
+          <div class="panel-head"><span class="panel-title">三维网格码序列</span></div>
+          <div class="seq-table">
+            <div class="seq-head mono">
+              <span class="c-idx">#</span>
+              <span class="c-code">网格三维码</span>
+              <span class="c-in">进入</span>
+              <span class="c-out">离开</span>
             </div>
-          </div>
-          <div v-else class="empty-state">等待拾取</div>
-        </section>
-
-        <section class="panel-section panel-section--fill">
-          <div class="panel-title">风险事件</div>
-          <div class="risk-list">
-            <div v-for="event in selectedRisks" :key="event.id" class="risk-row" :class="riskClass(event.level)">
-              <div class="risk-row__head">
-                <strong>{{ event.title }}</strong>
-                <span>{{ riskLevelLabel(event.level) }}风险</span>
+            <div class="seq-body">
+              <div
+                v-for="cell in selectedSequence"
+                :key="cell.code3D"
+                class="seq-row mono"
+                :class="{ conflict: conflictCodeSet.has(cell.code3D) }"
+              >
+                <span class="c-idx">{{ cell.index }}</span>
+                <span class="c-code">{{ cell.code3D }}</span>
+                <span class="c-in">{{ formatRelSec(cell.enterSec) }}</span>
+                <span class="c-out">{{ formatRelSec(cell.exitSec) }}</span>
               </div>
-              <p>{{ event.description }}</p>
+              <div v-if="selectedSequence.length === 0" class="seq-empty">无序列数据</div>
             </div>
-            <div v-if="selectedRisks.length === 0" class="empty-state">当前场景无风险</div>
           </div>
         </section>
 
-        <section class="panel-section">
-          <div class="panel-title">主体与装备</div>
-          <div class="registry-summary">
-            <div>
-              <span>注册航空器</span>
-              <strong>{{ operatorSummary.aircraft }}</strong>
-            </div>
-            <div>
-              <span>在线装备</span>
-              <strong>{{ operatorSummary.online }}</strong>
-            </div>
-            <div>
-              <span>飞手/机组</span>
-              <strong>{{ operatorSummary.pilots }}</strong>
-            </div>
+        <section v-if="conflicts.length > 0" class="panel">
+          <div class="panel-head">
+            <span class="panel-title">冲突明细</span>
+            <span class="panel-tag mono bad">{{ conflicts.length }}</span>
           </div>
-          <div class="aircraft-list">
-            <div v-for="aircraft in AIRCRAFT_REGISTRY.slice(0, 4)" :key="aircraft.id" class="aircraft-row">
-              <span>
-                <strong>{{ aircraft.id }}</strong>
-                <em>{{ aircraft.model }} · {{ aircraft.owner }}</em>
-              </span>
-              <b :class="`aircraft--${aircraft.status}`">{{ aircraftStatusLabel(aircraft.status) }}</b>
-            </div>
-          </div>
+          <ul class="conflict-list">
+            <li v-for="(c, i) in conflicts.slice(0, 6)" :key="c.code3D + i" class="conflict-item">
+              <div class="conflict-code mono">{{ c.code3D }}</div>
+              <div class="conflict-pair">{{ planNameById(c.planA) }} ⇄ {{ planNameById(c.planB) }}</div>
+              <div class="conflict-win mono">
+                重叠 {{ formatRelSec(c.overlapStartSec) }}–{{ formatRelSec(c.overlapEndSec) }}
+              </div>
+            </li>
+          </ul>
         </section>
       </template>
 
-      <template v-else-if="activeModule === 'airspace'">
-        <section class="panel-section">
-          <div class="panel-title">空域资源态势</div>
-          <div class="registry-summary">
-            <div>
-              <span>航路/起降</span>
-              <strong>{{ visibleZones.filter((zone) => zone.type === 'corridor' || zone.type === 'takeoff' || zone.type === 'landing').length }}</strong>
-            </div>
-            <div>
-              <span>禁限飞</span>
-              <strong>{{ visibleZones.filter((zone) => zone.type === 'no-fly' || zone.type === 'restricted').length }}</strong>
-            </div>
-            <div>
-              <span>临时管制</span>
-              <strong>{{ visibleZones.filter((zone) => zone.type === 'emergency').length }}</strong>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel-section panel-section--fill">
-          <div class="panel-title">资源单元详情</div>
-          <div class="zone-list">
-            <button v-for="zone in visibleZones" :key="zone.id" class="zone-card" type="button" @click="flyToZone(zone)">
-              <span>
-                <strong>{{ zone.name }}</strong>
-                <em>{{ zoneTypeLabel(zone.type) }} · 高度 {{ zone.heightRange.min }}-{{ zone.heightRange.max }}m</em>
-              </span>
-              <i>{{ zone.scenario ? scenarioById(zone.scenario).name : '全域共享' }}</i>
-            </button>
-          </div>
-        </section>
-
-        <section class="panel-section">
-          <div class="panel-title">起降与服务设施</div>
-          <div class="facility-list">
-            <button v-for="facility in visibleFacilities" :key="facility.id" type="button" class="facility-row" @click="flyToFacility(facility)">
-              <span>
-                <strong>{{ facility.name }}</strong>
-                <em>{{ facilityTypeLabel(facility.type) }} · 可用 {{ facility.available }}/{{ facility.capacity }}</em>
-              </span>
-              <b>{{ Math.round((facility.available / facility.capacity) * 100) }}%</b>
-            </button>
-          </div>
-        </section>
-      </template>
-
-      <template v-else-if="activeModule === 'approval'">
-        <section class="panel-section">
-          <div class="panel-title">计划审批看板</div>
-          <div class="approval-list">
-            <div v-for="approval in approvalQueue" :key="approval.id" class="approval-row" :class="`approval--${approval.status}`">
-              <div class="approval-row__head">
-                <strong>{{ approval.routeName }}</strong>
-                <span>{{ approvalStatusLabel(approval.status) }}</span>
-              </div>
-              <p>{{ approval.applicant }} · {{ approval.window }}</p>
-              <div class="risk-score">
-                <span>风险评分</span>
-                <strong>{{ approval.riskScore }}</strong>
-                <i :style="{ width: `${approval.riskScore}%` }"></i>
-              </div>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel-section">
-          <div class="panel-title">服务席位联动</div>
-          <div class="seat-grid">
-            <span v-for="seat in serviceSeats" :key="seat">{{ seat }}</span>
-          </div>
-        </section>
-
-        <section class="panel-section panel-section--fill">
-          <div class="panel-title">合规与冲突校核</div>
-          <div class="risk-list">
-            <div v-for="event in visibleRisks" :key="event.id" class="risk-row" :class="riskClass(event.level)">
-              <div class="risk-row__head">
-                <strong>{{ event.title }}</strong>
-                <span>{{ riskLevelLabel(event.level) }}风险</span>
-              </div>
-              <p>{{ event.description }}</p>
-            </div>
-          </div>
-        </section>
-      </template>
-
+      <!-- 场景①②④：拾取检视 -->
       <template v-else>
-        <section class="panel-section">
-          <div class="panel-title">产业运行规模</div>
-          <div class="registry-summary">
-            <div>
-              <span>月保障架次</span>
-              <strong>{{ operatorSummary.sorties }}</strong>
+        <section class="panel">
+          <div class="panel-head"><span class="panel-title">最近拾取</span></div>
+          <div v-if="lastPick" class="pick-card">
+            <div class="pick-3d mono phos">{{ lastPick.code3D }}</div>
+            <div class="pick-2d mono">{{ lastPick.code2D }}</div>
+            <div class="pick-grid">
+              <div class="pick-cell">
+                <span class="pick-k">级别</span>
+                <span class="pick-v mono">L{{ lastPick.level }}</span>
+              </div>
+              <div class="pick-cell">
+                <span class="pick-k">经度</span>
+                <span class="pick-v mono">{{ fmtLon(lastPick.center.lonDeg) }}</span>
+              </div>
+              <div class="pick-cell">
+                <span class="pick-k">纬度</span>
+                <span class="pick-v mono">{{ fmtLat(lastPick.center.latDeg) }}</span>
+              </div>
+              <div class="pick-cell">
+                <span class="pick-k">高程</span>
+                <span class="pick-v mono">{{ fmtH(lastPick.center.heightMeters) }}</span>
+              </div>
             </div>
-            <div>
-              <span>运营主体</span>
-              <strong>{{ LOW_ALTITUDE_OPERATORS.length }}</strong>
-            </div>
-            <div>
-              <span>注册装备</span>
-              <strong>{{ operatorSummary.aircraft }}</strong>
-            </div>
+          </div>
+          <div v-else class="pick-empty">
+            <p>移动光标看左下十字丝读数</p>
+            <p class="dim">单击作战图立方体钉入网格</p>
           </div>
         </section>
 
-        <section class="panel-section panel-section--fill">
-          <div class="panel-title">主体合规率</div>
-          <div class="operator-list">
-            <div v-for="operator in LOW_ALTITUDE_OPERATORS" :key="operator.id" class="operator-row">
-              <span>
-                <strong>{{ operator.name }}</strong>
-                <em>{{ operatorTypeLabel(operator.type) }} · {{ operator.monthlySorties }}架次/月</em>
-              </span>
-              <b>{{ operator.complianceRate }}%</b>
-            </div>
+        <section class="panel panel-grow">
+          <div class="panel-head">
+            <span class="panel-title">已钉网格</span>
+            <span class="panel-tag mono">{{ pinnedGrids.length }}</span>
           </div>
-        </section>
-
-        <section class="panel-section">
-          <div class="panel-title">装备状态</div>
-          <div class="aircraft-list">
-            <div v-for="aircraft in AIRCRAFT_REGISTRY" :key="aircraft.id" class="aircraft-row">
-              <span>
-                <strong>{{ aircraft.id }}</strong>
-                <em>{{ aircraft.model }} · 最大 {{ aircraft.maxAltitude }}m</em>
-              </span>
-              <b :class="`aircraft--${aircraft.status}`">{{ aircraftStatusLabel(aircraft.status) }}</b>
-            </div>
-          </div>
+          <ul class="pin-list">
+            <li v-for="grid in pinnedGrids" :key="grid.code3D" class="pin">
+              <div class="pin-body">
+                <div class="pin-code mono phos">{{ grid.code3D }}</div>
+                <div class="pin-meta mono">
+                  L{{ grid.level }}·{{ fmtLon(grid.center.lonDeg) }} {{ fmtLat(grid.center.latDeg) }}
+                </div>
+              </div>
+              <button class="pin-del" type="button" @click="removePin(grid.code3D)">×</button>
+            </li>
+            <li v-if="pinnedGrids.length === 0" class="pin-empty">尚无钉入网格</li>
+          </ul>
         </section>
       </template>
     </aside>
 
-    <section class="bottom-dock panel-shell">
-      <template v-if="activeModule === 'overview'">
-        <div class="playback">
-          <el-button type="primary" @click="togglePlay">{{ isPlaying ? '暂停模拟' : '播放模拟' }}</el-button>
-          <el-button plain @click="replaySelectedMission">重放任务</el-button>
-          <el-button plain @click="() => selectedPosition && flyToPoint(selectedPosition.lon, selectedPosition.lat, selectedPosition.height, 5200, 0.8)">
-            定位任务
-          </el-button>
-          <div class="industry-cards">
-            <div v-for="metric in INDUSTRY_METRICS.slice(0, 3)" :key="metric.label" :class="`industry-card industry-card--${metric.tone}`">
-              <span>{{ metric.label }}</span>
-              <strong>{{ metric.value }}</strong>
-              <em>{{ metric.delta }}</em>
-            </div>
-          </div>
-        </div>
-
-        <div class="airspace-load">
-          <div class="dock-title">片区空域繁忙度</div>
-          <div v-for="area in AREA_LOADS" :key="area.id" class="load-row">
-            <span>{{ area.name }}</span>
-            <i><b :style="{ width: `${area.load}%` }"></b></i>
-            <em>{{ area.flights }} 架次</em>
-          </div>
-        </div>
-
-        <div class="trend-card">
-          <div class="dock-title">时段运行趋势</div>
-          <div class="trend-chart">
-            <div v-for="point in FLIGHT_TRENDS" :key="point.label" class="trend-bar">
-              <span class="trend-bar__sorties" :style="{ height: `${Math.max(8, (point.sorties / trendMax) * 76)}px` }"></span>
-              <span class="trend-bar__approvals" :style="{ height: `${Math.max(6, (point.approvals / trendMax) * 76)}px` }"></span>
-              <em>{{ point.label }}</em>
-            </div>
-          </div>
-        </div>
-      </template>
-
-      <template v-else-if="activeModule === 'airspace'">
-        <div class="dock-card dock-card--rules">
-          <div class="dock-title">空域分类</div>
-          <div class="compact-rule-list">
-            <span v-for="rule in airspaceRuleCards" :key="rule.title">{{ rule.title }}</span>
-          </div>
-          <p>按管制空域、适飞空域、临时管制空域组织显示与调度。</p>
-        </div>
-
-        <div class="dock-card">
-          <div class="dock-title">高度层容量</div>
-          <div v-for="band in altitudeBands" :key="band.label" class="load-row">
-            <span>{{ band.label }}</span>
-            <i><b :style="{ width: `${band.load}%` }"></b></i>
-            <em>{{ band.load }}%</em>
-          </div>
-        </div>
-
-        <div class="dock-card">
-          <div class="dock-title">设施可用性</div>
-          <div v-for="facility in visibleFacilities.slice(0, 4)" :key="facility.id" class="capacity-row">
-            <span>{{ facility.name }}</span>
-            <b>{{ facility.available }}/{{ facility.capacity }}</b>
-          </div>
-        </div>
-      </template>
-
-      <template v-else-if="activeModule === 'approval'">
-        <div class="dock-card">
-          <div class="dock-title">计划要素</div>
-          <div class="query-grid query-grid--dock">
-            <span v-for="field in planQueryFields" :key="field">{{ field }}</span>
-          </div>
-        </div>
-
-        <div class="dock-card">
-          <div class="dock-title">审批流转</div>
-          <div class="step-strip">
-            <span v-for="step in approvalSteps" :key="step.label">{{ step.label }}</span>
-          </div>
-        </div>
-
-        <div class="dock-card">
-          <div class="dock-title">风险复核</div>
-          <div v-for="approval in approvalQueue.slice(0, 3)" :key="approval.id" class="load-row">
-            <span>{{ approval.routeName }}</span>
-            <i><b :style="{ width: `${approval.riskScore}%` }"></b></i>
-            <em>{{ approval.riskScore }}</em>
-          </div>
-        </div>
-      </template>
-
-      <template v-else>
-        <div class="dock-card">
-          <div class="dock-title">产业指标</div>
-          <div class="industry-cards industry-cards--dock">
-            <div v-for="metric in INDUSTRY_METRICS.slice(0, 3)" :key="metric.label" :class="`industry-card industry-card--${metric.tone}`">
-              <span>{{ metric.label }}</span>
-              <strong>{{ metric.value }}</strong>
-              <em>{{ metric.delta }}</em>
-            </div>
-          </div>
-        </div>
-
-        <div class="dock-card">
-          <div class="dock-title">服务链条</div>
-          <div class="chain-inline">
-            <span v-for="item in industryChain" :key="item.label">{{ item.label }}</span>
-          </div>
-        </div>
-
-        <div class="dock-card">
-          <div class="dock-title">主体架次</div>
-          <div v-for="operator in LOW_ALTITUDE_OPERATORS.slice(0, 4)" :key="operator.id" class="capacity-row">
-            <span>{{ operator.name }}</span>
-            <b>{{ operator.monthlySorties }}</b>
-          </div>
-        </div>
-      </template>
-
-      <div class="render-controls">
-        <div class="layer-controls">
-          <label><el-switch v-model="operationToggles.routes" />航线</label>
-          <label><el-switch v-model="operationToggles.zones" />空域</label>
-          <label><el-switch v-model="operationToggles.risks" />风险</label>
-          <label><el-switch v-model="operationToggles.aircraft" />机位</label>
-          <label><el-switch v-model="operationToggles.sites" />站点</label>
-          <label><el-switch v-model="showGridOverlay" />网格</label>
-        </div>
-        <el-radio-group :model-value="renderMode" @change="onModeChange">
-          <el-radio-button value="wire">线框</el-radio-button>
-          <el-radio-button value="fill">填充</el-radio-button>
-        </el-radio-group>
-        <el-select :model-value="levelMode" class="level-select" @change="onLevelChange">
-          <el-option
-            v-for="opt in levelOptions"
-            :key="String(opt.value)"
-            :label="opt.label"
-            :value="opt.value"
-          />
-        </el-select>
-        <div class="opacity-control" :class="{ 'opacity-control--muted': renderMode !== 'fill' }">
-          <span>透明度</span>
-          <el-slider
-            v-model="fillOpacity"
-            :min="4"
-            :max="100"
-            :disabled="renderMode !== 'fill'"
-            :format-tooltip="fmtPercent"
-            @input="onFillOpacityChange"
-          />
-        </div>
-        <el-button plain @click="onClearSelections">清除选中</el-button>
-        <span class="dock-note">模拟数据 · 思茅区 bbox {{ SIMAO_BBOX.west }}~{{ SIMAO_BBOX.east }}</span>
+    <!-- 签名：网格读数十字丝 HUD -->
+    <div class="reticle" :class="{ live: !!cursor }">
+      <div class="reticle-cross">
+        <span class="cross-h"></span>
+        <span class="cross-v"></span>
+        <span class="cross-dot"></span>
       </div>
-    </section>
+      <div class="reticle-panel">
+        <div class="reticle-label mono">光标网格读数 · L{{ activeLevel }}</div>
+        <template v-if="cursorCode">
+          <div class="reticle-code mono">{{ cursorCode.code3D }}</div>
+          <div class="reticle-coords mono">
+            {{ fmtLon(cursorCode.lonDeg) }} · {{ fmtLat(cursorCode.latDeg) }} · {{ fmtH(cursorCode.heightMeters) }}
+          </div>
+        </template>
+        <div v-else class="reticle-idle mono">移入作战图取读数</div>
+      </div>
+    </div>
+
+    <!-- 底状态条 -->
+    <footer class="statusbar mono">
+      <span class="status-item">级别 <b>{{ levelText }}</b></span>
+      <span class="status-sep">|</span>
+      <span class="status-item">模式 <b>{{ modeText }}</b></span>
+      <span class="status-sep">|</span>
+      <span class="status-item">场景 <b>{{ SCENARIO_NAME[activeScenario] }}</b></span>
+      <span class="status-sep">|</span>
+      <span v-if="activeScenario === 'sub'" class="status-item">单格 <b>{{ cellSizeLabel }}</b></span>
+      <span v-else-if="activeScenario === 'iso'" class="status-item">隔离 <b>{{ isolationTotal }} 格</b></span>
+      <span v-else-if="activeScenario === 'cor'" class="status-item">
+        冲突 <b :class="{ bad: conflicts.length > 0 }">{{ conflicts.length }}</b>
+      </span>
+      <span v-else class="status-item">航迹 <b :class="{ phos: droneFlying }">{{ droneFlying ? '巡航中' : '待命' }}</b></span>
+
+      <span class="status-spacer"></span>
+
+      <span v-if="cursor" class="status-item">
+        坐标 <b>{{ fmtLon(cursor.lonDeg) }} {{ fmtLat(cursor.latDeg) }}</b>
+      </span>
+      <span v-else class="status-item dim">坐标 待命</span>
+      <span class="status-sep">|</span>
+      <span class="status-item dim">基准 CGCS2000 / GeoSOT</span>
+    </footer>
   </div>
 </template>
 
-<style scoped>
-.workspace {
-  --accent: #35c4ff;
-  --accent-rgb: 53, 196, 255;
-  --accent-2: #30d158;
-  --accent-2-rgb: 48, 209, 88;
-  --danger: #ff2d55;
-  --warning: #ff9500;
-  position: relative;
-  width: 100vw;
-  height: 100vh;
+<style>
+/* ============================================================
+   北斗网格管制台 · 视觉令牌（雷达深空 + 磷光琥珀）
+   实心面板 + 1px hairline + 等宽数据 + 单一磷光琥珀强调色。
+   禁止：毛玻璃 / 霓虹高饱和 / 多套换肤 / 渐变药丸 / 大圆角。
+   ============================================================ */
+.console {
+  --bg: #0a0e12;
+  --panel: #11161c;
+  --panel-2: #161d25;
+  --line: #243039;
+  --line-soft: #1a222a;
+  --ink: #c7d2dc;
+  --ink-mid: #8d9aa6;
+  --ink-dim: #61707c;
+  --phosphor: #d8a24a;
+  --phosphor-2: #e8c074;
+  --phosphor-dim: #9a7438;
+  --signal: #c8503a;
+  --signal-2: #e0654c;
+  --ok: #5a8c6e;
+  --info: #4a7a96;
+
+  --display: 'Barlow Semi Condensed', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --body: 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  --mono: 'JetBrains Mono', 'DejaVu Sans Mono', ui-monospace, monospace;
+
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: 13px;
   overflow: hidden;
-  background: #07090d;
-  color: #e8eef6;
-  font-family: 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
 }
 
-.workspace--airspace {
-  --accent: #35f0c4;
-  --accent-rgb: 53, 240, 196;
-  --accent-2: #64d2ff;
-  --accent-2-rgb: 100, 210, 255;
+.console .mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
 }
 
-.workspace--approval {
-  --accent: #ffd60a;
-  --accent-rgb: 255, 214, 10;
-  --accent-2: #ff9500;
-  --accent-2-rgb: 255, 149, 0;
-}
-
-.workspace--industry {
-  --accent: #c77dff;
-  --accent-rgb: 199, 125, 255;
-  --accent-2: #64d2ff;
-  --accent-2-rgb: 100, 210, 255;
-}
-
-.cesium-container {
+/* —— 作战图 —— */
+.console .map {
   position: absolute;
   inset: 0;
 }
+.console .cesium-viewer-bottom,
+.console .cesium-widget-credits,
+.console .cesium-viewer-toolbar,
+.console .cesium-viewer-animationContainer,
+.console .cesium-viewer-timelineContainer {
+  display: none !important;
+}
 
-.panel-shell {
+/* —— 顶栏 —— */
+.console .topbar {
   position: absolute;
-  border: 1px solid rgba(var(--accent-rgb), 0.22);
-  border-radius: 8px;
-  background: rgba(12, 16, 22, 0.78);
-  backdrop-filter: blur(18px) saturate(140%);
-  -webkit-backdrop-filter: blur(18px) saturate(140%);
-  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.36);
-}
-
-.topbar {
-  position: absolute;
-  top: 14px;
-  left: 14px;
-  right: 14px;
-  height: 76px;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 46px;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 0 18px;
-  border: 1px solid rgba(var(--accent-rgb), 0.22);
-  border-radius: 8px;
-  background: rgba(11, 15, 21, 0.76);
-  backdrop-filter: blur(18px);
-  z-index: 5;
+  align-items: stretch;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  z-index: 20;
 }
-
-.brand {
-  flex: 0 0 380px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-}
-.brand > div {
-  min-width: 0;
-}
-.brand__mark {
-  width: 12px;
-  height: 34px;
-  border-radius: 3px;
-  background: linear-gradient(180deg, var(--accent), var(--accent-2));
-}
-.brand h1 {
-  margin: 0;
-  font-size: 18px;
-  line-height: 1.2;
-  color: #f6fbff;
-}
-.brand p {
-  max-width: 260px;
-  margin: 4px 0 0;
-  overflow: hidden;
-  font-size: 12px;
-  color: #98aabb;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.brand__badge {
-  flex: none;
-  padding: 5px 8px;
-  border-radius: 999px;
-  background: rgba(var(--accent-rgb), 0.16);
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 700;
-}
-
-.module-tabs {
-  display: flex;
-  gap: 6px;
-  padding: 4px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.045);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-.module-tab {
-  height: 44px;
-  min-width: 76px;
-  padding: 0 10px;
-  border: 0;
-  border-radius: 5px;
-  background: transparent;
-  color: #aebbc8;
-  font-size: 12px;
-  font-weight: 700;
-  cursor: pointer;
-}
-.module-tab__label,
-.module-tab__sub {
-  display: block;
-  line-height: 1.25;
-}
-.module-tab__sub {
-  margin-top: 3px;
-  color: #788895;
-  font-size: 10px;
-  font-weight: 600;
-}
-.module-tab--active {
-  background: rgba(var(--accent-rgb), 0.22);
-  color: #f6fbff;
-  box-shadow: inset 0 0 0 1px rgba(var(--accent-rgb), 0.38);
-}
-.module-tab--active .module-tab__sub {
-  color: color-mix(in srgb, var(--accent) 72%, #ffffff 28%);
-}
-
-.kpis {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(62px, 1fr));
-  gap: 8px;
-  flex: 1;
-}
-.kpi {
-  min-width: 0;
-  padding: 7px 8px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.055);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-.kpi span {
-  display: block;
-  font-size: 11px;
-  color: #91a0ad;
-}
-.kpi strong {
-  display: block;
-  margin-top: 2px;
-  font-size: 20px;
-  color: var(--accent);
-  font-variant-numeric: tabular-nums;
-}
-.kpi--warn strong {
-  color: var(--warning);
-}
-
-.module-banner {
-  top: 104px;
-  left: 360px;
-  right: 398px;
-  min-height: 44px;
-  display: grid;
-  grid-template-columns: max-content max-content minmax(0, 1fr) max-content;
-  align-items: center;
-  gap: 10px;
-  padding: 9px 12px;
-  z-index: 3;
-}
-.module-banner span {
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: rgba(var(--accent-rgb), 0.18);
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 800;
-}
-.module-banner strong {
-  color: #f8fbff;
-  font-size: 14px;
-}
-.module-banner em {
-  min-width: 0;
-  overflow: hidden;
-  color: #98aabb;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-style: normal;
-  font-size: 12px;
-}
-.module-panel-trigger {
-  height: 28px;
-  padding: 0 12px;
-  border: 1px solid rgba(var(--accent-rgb), 0.38);
-  border-radius: 6px;
-  background: rgba(var(--accent-rgb), 0.14);
-  color: #f2fbff;
-  font-size: 12px;
-  font-weight: 800;
-  cursor: pointer;
-}
-.module-panel-trigger:hover {
-  background: rgba(var(--accent-rgb), 0.24);
-}
-:deep(.module-dialog) {
-  border: 1px solid rgba(var(--accent-rgb), 0.26);
-  border-radius: 8px;
-  background: rgba(12, 18, 24, 0.94);
-  box-shadow: 0 28px 72px rgba(0, 0, 0, 0.52);
-}
-:deep(.module-dialog .el-dialog__header) {
-  margin: 0;
-  padding: 16px 18px 10px;
-}
-:deep(.module-dialog .el-dialog__body) {
-  padding: 0 18px 18px;
-}
-:deep(.module-dialog .el-dialog__headerbtn .el-dialog__close) {
-  color: #d7e6f5;
-}
-.module-dialog__head {
-  display: grid;
-  grid-template-columns: max-content max-content minmax(0, 1fr);
-  align-items: center;
-  gap: 10px;
-  padding-right: 34px;
-}
-.module-dialog__head span {
-  padding: 4px 8px;
-  border-radius: 999px;
-  background: rgba(var(--accent-rgb), 0.18);
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 800;
-}
-.module-dialog__head strong {
-  color: #f8fbff;
-  font-size: 15px;
-}
-.module-dialog__head em {
-  min-width: 0;
-  overflow: hidden;
-  color: #98aabb;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-style: normal;
-  font-size: 12px;
-}
-.module-focus-content {
-  height: min(58vh, 560px);
-  min-height: 360px;
-}
-.focus-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-.focus-head span {
-  padding: 4px 8px;
-  border-radius: 999px;
-  background: rgba(var(--accent-rgb), 0.16);
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 800;
-}
-.focus-head strong {
-  min-width: 0;
-  overflow: hidden;
-  color: #f6fbff;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 14px;
-}
-.overview-command-grid,
-.airspace-work-grid,
-.approval-work-grid,
-.industry-work-grid {
-  min-height: 0;
-  height: calc(100% - 36px);
-  display: grid;
-  grid-template-columns: 1.1fr 1.2fr 1fr;
-  gap: 10px;
-}
-.command-card,
-.seat-board,
-.event-stream,
-.airspace-profile,
-.grid-ledger,
-.airspace-policy,
-.approval-case-card,
-.compliance-list,
-.decision-rules,
-.scenario-portfolio,
-.operator-rank,
-.facility-mosaic {
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.052);
-  border: 1px solid rgba(255, 255, 255, 0.075);
-}
-.command-card,
-.approval-case-card {
+.console .brand {
   display: flex;
   flex-direction: column;
   justify-content: center;
-  padding: 14px;
+  padding: 0 16px;
+  border-right: 1px solid var(--line);
 }
-.command-card span,
-.approval-case-card span {
-  color: #91a0ad;
-  font-size: 11px;
+.console .brand-mark {
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.5px;
+  color: var(--phosphor);
 }
-.command-card strong,
-.approval-case-card strong {
-  display: block;
-  margin-top: 8px;
-  color: #ffffff;
-  font-size: 18px;
-  line-height: 1.25;
+.console .brand-sub {
+  font-size: 10px;
+  color: var(--ink-dim);
+  letter-spacing: 1px;
 }
-.command-card em,
-.approval-case-card em {
-  display: block;
-  margin-top: 8px;
-  color: #9fafbd;
-  font-style: normal;
+.console .tabs {
+  display: flex;
+  align-items: stretch;
+}
+.console .tab {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  min-width: 78px;
+  padding: 0 14px;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--line-soft);
+  border-bottom: 2px solid transparent;
+  color: var(--ink-mid);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.console .tab:hover {
+  background: var(--panel-2);
+  color: var(--ink);
+}
+.console .tab.active {
+  color: var(--phosphor-2);
+  border-bottom-color: var(--phosphor);
+  box-shadow: inset 0 -10px 18px -14px var(--phosphor);
+}
+.console .tab-code {
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 1px;
+}
+.console .tab-name {
+  font-size: 10px;
+  letter-spacing: 0.5px;
+}
+.console .topbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 0 16px;
+}
+.console .region-btns {
+  display: flex;
+  gap: 6px;
+}
+.console .region-btn {
+  padding: 5px 11px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink-mid);
   font-size: 12px;
-  line-height: 1.45;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
 }
-.command-card i,
-.approval-case-card i,
-.portfolio-row i,
-.airspace-lane i {
-  height: 6px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.12);
+.console .region-btn:hover {
+  color: var(--phosphor-2);
+  border-color: var(--phosphor-dim);
 }
-.command-card i,
-.approval-case-card i {
-  margin-top: 16px;
+.console .clock {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--phosphor);
+  letter-spacing: 1px;
 }
-.command-card b,
-.approval-case-card b,
-.portfolio-row b,
-.airspace-lane b {
-  display: block;
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
-}
-.seat-board,
-.event-stream,
-.grid-ledger,
-.airspace-policy,
-.compliance-list,
-.decision-rules,
-.scenario-portfolio,
-.operator-rank {
+
+/* —— 两侧 rail —— */
+.console .rail {
+  position: absolute;
+  top: 46px;
+  bottom: 28px;
+  background: var(--panel);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
   overflow-y: auto;
-  padding: 10px;
+  z-index: 15;
 }
-.seat-row,
-.compliance-row,
-.ledger-row,
-.rank-row {
+.console .rail-left {
+  left: 0;
+  width: 300px;
+  border-right: 1px solid var(--line);
+}
+.console .rail-right {
+  right: 0;
+  width: 320px;
+  border-left: 1px solid var(--line);
+}
+
+/* —— 面板 —— */
+.console .panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 11px 12px;
+}
+.console .panel-grow {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 120px;
+}
+.console .panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.console .panel-title {
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: 13px;
+  letter-spacing: 0.5px;
+  color: var(--ink);
+}
+.console .panel-tag {
+  font-size: 11px;
+  color: var(--ink-dim);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  padding: 1px 6px;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.console .panel-tag.bad {
+  color: var(--signal-2);
+  border-color: var(--signal);
+}
+.console .panel-note {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-dim);
+  margin-top: 8px;
+}
+
+/* —— 分段控件 —— */
+.console .seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.console .seg-levels {
   display: grid;
-  grid-template-columns: 54px minmax(0, 1fr);
-  align-items: start;
+  grid-template-columns: repeat(4, 1fr);
+}
+.console .seg-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink-mid);
+  font-size: 12px;
+  text-align: center;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.console .seg-btn:hover {
+  color: var(--ink);
+  border-color: var(--phosphor-dim);
+}
+.console .seg-btn.active {
+  color: var(--phosphor-2);
+  border-color: var(--phosphor);
+  background: rgba(216, 162, 74, 0.11);
+}
+
+/* —— 滑块 / 字段 —— */
+.console .field {
+  margin-top: 10px;
+}
+.console .field-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--ink-mid);
+  margin-bottom: 6px;
+}
+.console .slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  background: var(--line);
+  border-radius: 2px;
+  outline: none;
+}
+.console .slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 2px;
+  background: var(--phosphor);
+  border: 1px solid var(--phosphor-2);
+  cursor: pointer;
+}
+.console .slider::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 2px;
+  background: var(--phosphor);
+  border: 1px solid var(--phosphor-2);
+  cursor: pointer;
+}
+
+/* —— checkbox —— */
+.console .check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--ink-mid);
+  cursor: pointer;
+}
+.console .check input {
+  accent-color: var(--phosphor);
+  width: 13px;
+  height: 13px;
+}
+
+/* —— 账册 —— */
+.console .ledger {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.console .ledger-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 12px;
+}
+.console .ledger-row:last-child {
+  border-bottom: none;
+}
+.console .ledger-row dt {
+  color: var(--ink-mid);
+}
+.console .ledger-row dd {
+  color: var(--ink);
+}
+.console .ledger-row.strong dt {
+  color: var(--ink);
+  font-weight: 600;
+}
+.console .phos {
+  color: var(--phosphor-2);
+}
+
+/* —— 行内按钮 —— */
+.console .btn-line {
+  margin-top: 10px;
+  width: 100%;
+  padding: 7px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink-mid);
+  font-size: 12px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.console .btn-line:hover {
+  color: var(--signal-2);
+  border-color: var(--signal);
+}
+.console .btn-block {
+  width: 100%;
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  font-family: var(--display);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.console .btn-block.is-go {
+  background: rgba(216, 162, 74, 0.12);
+  border-color: var(--phosphor);
+  color: var(--phosphor-2);
+}
+.console .btn-block.is-go:hover {
+  background: rgba(216, 162, 74, 0.2);
+}
+.console .btn-block.is-stop {
+  background: rgba(200, 80, 58, 0.14);
+  border-color: var(--signal);
+  color: var(--signal-2);
+}
+.console .btn-block.is-stop:hover {
+  background: rgba(200, 80, 58, 0.22);
+}
+
+/* —— 障碍物列表（场景②）—— */
+.console .obstacle-list,
+.console .plan-list,
+.console .pin-list,
+.console .aircraft-list,
+.console .conflict-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+}
+.console .panel-grow .obstacle-list,
+.console .panel-grow .plan-list,
+.console .panel-grow .pin-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+}
+.console .obstacle {
+  display: flex;
+  align-items: flex-start;
   gap: 9px;
   padding: 8px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  border-bottom: 1px solid var(--line-soft);
 }
-.ledger-row,
-.rank-row {
-  grid-template-columns: minmax(0, 1fr) 48px;
-}
-.seat-row:last-child,
-.compliance-row:last-child,
-.ledger-row:last-child,
-.rank-row:last-child {
+.console .obstacle:last-child {
   border-bottom: none;
 }
-.seat-row b,
-.compliance-row b {
-  padding: 3px 6px;
-  border-radius: 999px;
-  background: rgba(var(--accent-rgb), 0.18);
-  color: var(--accent);
-  text-align: center;
-  font-size: 10px;
+.console .obstacle.off {
+  opacity: 0.42;
 }
-.seat-row__state--warn,
-.compliance-row__state--warn {
-  background: rgba(255, 149, 0, 0.18) !important;
-  color: #ffd49a !important;
-}
-.seat-row strong,
-.compliance-row strong,
-.ledger-row strong,
-.rank-row strong {
-  display: block;
-  color: #f6fbff;
-  font-size: 12px;
-}
-.seat-row em,
-.compliance-row em,
-.ledger-row em,
-.rank-row em {
-  display: block;
+.console .dot-toggle {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
   margin-top: 3px;
-  overflow: hidden;
-  color: #8e9ead;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-style: normal;
-  font-size: 11px;
-}
-.event-stream__item {
-  display: grid;
-  grid-template-columns: 42px minmax(0, 1fr);
-  gap: 8px;
-  padding: 8px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-}
-.event-stream__item:last-child {
-  border-bottom: none;
-}
-.event-stream__item strong {
-  color: var(--accent);
-  font-size: 12px;
-}
-.event-stream__item span {
-  color: #d8e2ec;
-  font-size: 12px;
-  line-height: 1.4;
-}
-.airspace-profile {
-  display: grid;
-  align-content: stretch;
-  gap: 8px;
-  padding: 10px;
-}
-.airspace-lane,
-.portfolio-row {
-  display: grid;
-  grid-template-columns: minmax(104px, 1fr) minmax(0, 1.2fr) 32px;
-  align-items: center;
-  gap: 8px;
-}
-.airspace-lane {
-  min-height: 46px;
-}
-.airspace-lane strong,
-.portfolio-row strong {
-  display: block;
-  color: #f6fbff;
-  font-size: 12px;
-}
-.airspace-lane em,
-.portfolio-row em {
-  display: block;
-  margin-top: 2px;
-  overflow: hidden;
-  color: #8e9ead;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-style: normal;
-  font-size: 11px;
-}
-.airspace-lane small,
-.portfolio-row small {
-  color: #b8c5d2;
-  text-align: right;
-  font-size: 11px;
-}
-.ledger-row b,
-.rank-row b {
-  color: var(--accent);
-  text-align: right;
-  font-size: 13px;
-}
-.policy-pill,
-.decision-rule {
-  padding: 8px 0;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
-}
-.policy-pill:last-child,
-.decision-rule:last-child {
-  border-bottom: none;
-}
-.policy-pill strong,
-.decision-rule strong {
-  display: block;
-  color: #f6fbff;
-  font-size: 12px;
-}
-.policy-pill span,
-.decision-rule span {
-  display: block;
-  margin-top: 4px;
-  color: #8e9ead;
-  font-size: 11px;
-  line-height: 1.45;
-}
-.facility-mosaic {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-  padding: 10px;
-}
-.facility-chip {
-  min-width: 0;
-  display: grid;
-  place-content: center;
-  gap: 4px;
-  border-radius: 6px;
-  background: rgba(var(--accent-rgb), 0.1);
-}
-.facility-chip strong,
-.facility-chip span {
-  text-align: center;
-}
-.facility-chip strong {
-  color: #f6fbff;
-  font-size: 12px;
-}
-.facility-chip span {
-  color: var(--accent);
-  font-size: 16px;
-  font-weight: 800;
-}
-
-.left-rail,
-.right-rail {
-  top: 104px;
-  bottom: 154px;
-  width: 330px;
-  display: flex;
-  flex-direction: column;
-  overflow-y: auto;
-  z-index: 4;
-}
-.left-rail {
-  left: 14px;
-}
-.right-rail {
-  right: 14px;
-  width: 370px;
-  overflow-y: auto;
-}
-
-.panel-section {
-  padding: 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-}
-.panel-section:last-child {
-  border-bottom: none;
-}
-.panel-section--fill {
-  min-height: 0;
-  flex: 1;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-}
-.panel-title {
-  margin-bottom: 10px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.6px;
-  color: color-mix(in srgb, var(--accent) 58%, #d9f2ff 42%);
-}
-
-.rule-grid,
-.metric-grid,
-.query-grid,
-.seat-grid {
-  display: grid;
-  gap: 8px;
-}
-.rule-grid {
-  grid-template-columns: 1fr 1fr;
-}
-.rule-card,
-.chain-row,
-.operator-row,
-.facility-row,
-.zone-row,
-.zone-card,
-.dock-card {
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.052);
-  border: 1px solid rgba(255, 255, 255, 0.075);
-}
-.rule-card {
-  min-height: 82px;
-  padding: 9px;
-}
-.rule-card strong,
-.chain-row strong,
-.operator-row strong,
-.zone-row strong,
-.zone-card strong,
-.facility-row strong {
-  display: block;
-  color: #f6fbff;
-  font-size: 12px;
-}
-.rule-card span,
-.chain-row span,
-.operator-row em,
-.zone-row em,
-.zone-card em,
-.facility-row em {
-  display: block;
-  margin-top: 4px;
-  color: #8e9ead;
-  font-style: normal;
-  font-size: 11px;
-  line-height: 1.45;
-}
-.altitude-band {
-  display: grid;
-  grid-template-columns: 88px minmax(0, 1fr) 36px;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-  font-size: 11px;
-}
-.altitude-band span,
-.zone-row__main,
-.operator-row span,
-.facility-row span,
-.zone-card span {
-  min-width: 0;
-}
-.altitude-band strong,
-.altitude-band em {
-  display: block;
-}
-.altitude-band strong {
-  color: #f6fbff;
-  font-size: 12px;
-}
-.altitude-band em {
-  overflow: hidden;
-  color: #8e9ead;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-style: normal;
-}
-.altitude-band i {
-  height: 6px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.13);
-}
-.altitude-band b {
-  display: block;
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
-}
-.altitude-band small {
-  color: #b8c5d2;
-  text-align: right;
-}
-.zone-list,
-.operator-list,
-.facility-list {
-  min-height: 0;
-  overflow-y: auto;
-  display: grid;
-  gap: 8px;
-  padding-right: 3px;
-}
-.zone-row,
-.zone-card,
-.facility-row {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 9px 10px;
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-.zone-row:hover,
-.zone-card:hover,
-.facility-row:hover {
-  border-color: rgba(var(--accent-rgb), 0.34);
-  background: rgba(var(--accent-rgb), 0.08);
-}
-.zone-card {
-  align-items: flex-start;
-  flex-direction: column;
-}
-.zone-card i {
-  color: var(--accent);
-  font-style: normal;
-  font-size: 11px;
-}
-.query-grid {
-  grid-template-columns: repeat(2, 1fr);
-}
-.query-grid span,
-.seat-grid span,
-.compact-rule-list span,
-.step-strip span,
-.chain-inline span {
-  min-width: 0;
-  padding: 7px 8px;
-  border-radius: 6px;
-  background: rgba(var(--accent-rgb), 0.11);
-  color: #dcebf7;
-  text-align: center;
-  font-size: 11px;
-}
-.seat-grid {
-  grid-template-columns: repeat(2, 1fr);
-}
-.approval-stepper {
-  display: grid;
-  gap: 8px;
-}
-.approval-step {
-  display: grid;
-  grid-template-columns: 24px minmax(0, 1fr);
-  align-items: center;
-  gap: 8px;
-}
-.approval-step b {
-  width: 24px;
-  height: 24px;
-  display: grid;
-  place-items: center;
   border-radius: 50%;
-  background: rgba(var(--accent-rgb), 0.2);
-  color: var(--accent);
-  font-size: 12px;
-}
-.approval-step strong,
-.approval-step em {
-  display: block;
-}
-.approval-step strong {
-  color: #f6fbff;
-  font-size: 12px;
-}
-.approval-step em {
-  color: #8e9ead;
-  font-style: normal;
-  font-size: 11px;
-}
-.approval-list--scroll {
-  min-height: 0;
-  overflow-y: auto;
-  padding-right: 3px;
-}
-.metric-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-.chain-list {
-  display: grid;
-  gap: 8px;
-}
-.chain-row {
-  padding: 9px 10px;
-}
-.operator-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 9px 10px;
-}
-.operator-row b,
-.facility-row b,
-.capacity-row b {
-  flex: none;
-  color: var(--accent);
-  font-variant-numeric: tabular-nums;
-  font-size: 12px;
-}
-
-.scenario-row,
-.mission-row {
-  width: 100%;
-  border: 1px solid transparent;
-  border-radius: 6px;
+  border: 1px solid var(--line);
   background: transparent;
-  color: inherit;
-  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, box-shadow 0.15s;
+}
+.console .obstacle:not(.off) .dot-toggle.is-nofly {
+  background: var(--signal);
+  border-color: var(--signal-2);
+}
+.console .obstacle:not(.off) .dot-toggle.is-restricted {
+  background: var(--phosphor);
+  border-color: var(--phosphor-2);
+}
+.console .obstacle-body {
+  flex: 1 1 auto;
+  min-width: 0;
   cursor: pointer;
 }
-.scenario-row {
-  display: grid;
-  grid-template-columns: 14px minmax(0, 1fr) auto;
+.console .obstacle-top {
+  display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 9px;
+  justify-content: space-between;
+  gap: 6px;
 }
-.scenario-row:hover,
-.scenario-row--active,
-.mission-row:hover,
-.mission-row--active {
-  background: rgba(255, 255, 255, 0.07);
-  border-color: rgba(130, 200, 235, 0.28);
+.console .obstacle-name {
+  font-size: 12px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.scenario-row__dot {
+.console .obstacle-meta,
+.console .plan-meta {
+  font-size: 10.5px;
+  color: var(--ink-dim);
+  margin-top: 3px;
+}
+.console .pill {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 2px;
+  border: 1px solid;
+  letter-spacing: 0.5px;
+}
+.console .pill-nofly {
+  color: var(--signal-2);
+  border-color: var(--signal);
+  background: rgba(200, 80, 58, 0.1);
+}
+.console .pill-restricted {
+  color: var(--phosphor-2);
+  border-color: var(--phosphor-dim);
+  background: rgba(216, 162, 74, 0.1);
+}
+
+/* —— 飞行计划列表（场景③）—— */
+.console .plan {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 8px;
+  margin-bottom: 4px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.console .plan:hover {
+  background: var(--panel-2);
+}
+.console .plan.active {
+  border-color: var(--phosphor);
+  background: rgba(216, 162, 74, 0.1);
+}
+.console .plan-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  margin-top: 3px;
+  border-radius: 50%;
+}
+.console .plan-body {
+  min-width: 0;
+}
+.console .plan-name {
+  font-size: 12px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* —— 判定块（场景③）—— */
+.console .verdict {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 9px 11px;
+  border: 1px solid;
+  border-radius: 2px;
+  font-size: 12px;
+}
+.console .verdict-dot {
   width: 9px;
   height: 9px;
   border-radius: 50%;
 }
-.scenario-row__dot--all {
-  background: linear-gradient(135deg, #35c4ff, #ffd60a);
+.console .verdict-ok {
+  color: var(--ok);
+  border-color: rgba(90, 140, 110, 0.5);
+  background: rgba(90, 140, 110, 0.08);
 }
-.scenario-row__main {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
+.console .verdict-ok .verdict-dot {
+  background: var(--ok);
 }
-.scenario-row__meta {
-  color: #91a0ad;
-  font-size: 12px;
+.console .verdict-bad {
+  color: var(--signal-2);
+  border-color: var(--signal);
+  background: rgba(200, 80, 58, 0.1);
+}
+.console .verdict-bad .verdict-dot {
+  background: var(--signal);
 }
 
-.mission-list,
-.risk-list {
-  min-height: 0;
-  overflow-y: auto;
-  padding-right: 3px;
+/* —— 机型列表（场景④）—— */
+.console .aircraft-list {
+  gap: 5px;
 }
-.notice-list {
-  display: grid;
-  gap: 7px;
-}
-.notice-row {
-  display: grid;
-  grid-template-columns: 44px minmax(0, 1fr);
-  gap: 8px;
-  padding: 7px 8px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.045);
-  border-left: 3px solid #35c4ff;
-}
-.notice--warning {
-  border-left-color: #ff9500;
-}
-.notice--control {
-  border-left-color: #ff453a;
-}
-.notice-row__time {
-  color: #35f0c4;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
-.notice-row__body {
-  min-width: 0;
-}
-.notice-row__body strong {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-}
-.notice-row__body em {
-  display: block;
-  margin-top: 2px;
-  color: #8e9ead;
-  font-style: normal;
-  font-size: 11px;
-}
-.mission-row {
-  display: block;
-  padding: 10px;
-  margin-bottom: 8px;
-}
-.mission-row__head,
-.risk-row__head {
+.console .aircraft {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-}
-.mission-row__name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 13px;
-  font-weight: 700;
-}
-.mission-row__meta {
-  display: block;
-  margin-top: 5px;
-  color: #8e9ead;
-  font-size: 11.5px;
-}
-.progress {
-  display: block;
-  height: 4px;
-  margin-top: 8px;
-  overflow: hidden;
+  padding: 9px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
   border-radius: 2px;
-  background: rgba(255, 255, 255, 0.12);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
 }
-.progress__bar {
-  display: block;
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+.console .aircraft:hover {
+  border-color: var(--phosphor-dim);
 }
-
-.tag {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 34px;
-  height: 20px;
-  padding: 0 8px;
-  box-sizing: border-box;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1;
-  white-space: nowrap;
-  color: #101419;
-  background: #aab7c4;
+.console .aircraft.active {
+  border-color: var(--phosphor);
+  background: rgba(216, 162, 74, 0.11);
 }
-.status--running,
-.priority--normal {
-  background: var(--accent-2);
-}
-.status--warning,
-.priority--urgent {
-  background: var(--warning);
-}
-.status--planned,
-.priority--important {
-  background: var(--accent);
-}
-.status--completed {
-  background: #9aa4ad;
-}
-
-.detail-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-.detail-head > div {
-  min-width: 0;
-  flex: 1;
-}
-.detail-head .tag {
-  margin-top: 2px;
-}
-.detail-head h2 {
-  margin: 0;
-  font-size: 16px;
-}
-.detail-head p {
-  margin: 5px 0 0;
-  color: #91a0ad;
+.console .aircraft-name {
   font-size: 12px;
+  color: var(--ink);
 }
-.detail-grid {
+.console .aircraft.active .aircraft-name {
+  color: var(--phosphor-2);
+}
+.console .aircraft-map {
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+.console .aircraft.active .aircraft-map {
+  color: var(--phosphor);
+}
+
+/* —— 拾取检视（右栏）—— */
+.console .pick-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.console .pick-3d {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--phosphor-2);
+  word-break: break-all;
+  text-shadow: 0 0 10px rgba(216, 162, 74, 0.35);
+}
+.console .pick-2d {
+  font-size: 12px;
+  color: var(--ink-mid);
+  word-break: break-all;
+}
+.console .pick-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  margin-top: 12px;
+  gap: 1px;
+  background: var(--line-soft);
+  border: 1px solid var(--line-soft);
 }
-.detail-grid div {
-  min-width: 0;
-  padding: 8px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.055);
-}
-.detail-grid span,
-.mission-progress-line span,
-.code-block span {
-  display: block;
-  margin-bottom: 3px;
-  color: #8e9ead;
-  font-size: 11px;
-}
-.detail-grid strong {
-  display: block;
-  overflow-wrap: anywhere;
-  font-size: 12px;
-}
-.mission-progress-line {
+.console .pick-cell {
   display: flex;
-  justify-content: space-between;
-  margin: 12px 0 6px;
+  flex-direction: column;
+  gap: 2px;
+  padding: 7px 9px;
+  background: var(--panel);
 }
-.mission-progress-line strong {
-  color: var(--accent);
+.console .pick-k {
+  font-size: 10px;
+  color: var(--ink-dim);
+}
+.console .pick-v {
+  font-size: 12px;
+  color: var(--ink);
+}
+.console .pick-empty {
+  padding: 14px 4px;
+  font-size: 12px;
+  color: var(--ink-mid);
+  line-height: 1.7;
+}
+.console .pick-empty .dim {
+  color: var(--ink-dim);
+  font-size: 11px;
 }
 
-.approval-list {
-  display: grid;
-  gap: 8px;
-}
-.approval-row {
-  padding: 8px 9px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.05);
-  border-left: 3px solid var(--accent);
-}
-.approval--recheck {
-  border-left-color: #ff9500;
-}
-.approval--pending {
-  border-left-color: #ffd60a;
-}
-.approval--approved {
-  border-left-color: #30d158;
-}
-.approval-row__head {
+/* —— 已钉网格 —— */
+.console .pin {
   display: flex;
-  justify-content: space-between;
-  gap: 8px;
-}
-.approval-row__head strong {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 12px;
-}
-.approval-row__head span {
-  flex: none;
-  color: #cbd7e4;
-  font-size: 11px;
-}
-.approval-row p {
-  margin: 4px 0 7px;
-  color: #8e9ead;
-  font-size: 11.5px;
-}
-.risk-score {
-  position: relative;
-  display: grid;
-  grid-template-columns: 56px 28px minmax(0, 1fr);
   align-items: center;
-  gap: 7px;
+  gap: 8px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--line-soft);
 }
-.risk-score span {
-  color: #8e9ead;
-  font-size: 11px;
+.console .pin:last-child {
+  border-bottom: none;
 }
-.risk-score strong {
-  color: #ffcf70;
+.console .pin-body {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.console .pin-code {
   font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
-.risk-score i {
-  height: 4px;
-  overflow: hidden;
-  border-radius: 2px;
-  background: linear-gradient(90deg, var(--accent-2), #ffd60a, #ff453a);
-}
-
-.code-block {
-  display: grid;
-  gap: 6px;
-}
-.code-block code {
-  display: block;
-  max-width: 100%;
-  overflow-wrap: anywhere;
+  color: var(--phosphor-2);
   word-break: break-all;
-  padding: 7px 8px;
-  border-radius: 6px;
-  background: rgba(var(--accent-rgb), 0.08);
-  color: #f2f8ff;
-  font-size: 11px;
-  line-height: 1.45;
 }
-.code-meta {
-  display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  color: #b8c5d2;
-  font-size: 11px;
-}
-
-.risk-row {
-  margin-bottom: 8px;
-  padding: 9px 10px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.055);
-  border-left: 3px solid #ff9500;
-}
-.risk--high {
-  border-left-color: var(--danger);
-}
-.risk-row strong {
-  font-size: 13px;
-}
-.risk-row span {
-  color: #ffb86b;
-  font-size: 11px;
-}
-.risk-row p,
-.empty-state {
-  margin: 6px 0 0;
-  color: #91a0ad;
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.registry-summary {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
-  margin-bottom: 9px;
-}
-.registry-summary div {
-  padding: 8px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.055);
-}
-.registry-summary span {
-  display: block;
-  color: #8e9ead;
-  font-size: 11px;
-}
-.registry-summary strong {
-  display: block;
+.console .pin-meta {
+  font-size: 10px;
+  color: var(--ink-dim);
   margin-top: 2px;
-  color: var(--accent);
-  font-size: 18px;
-  font-variant-numeric: tabular-nums;
 }
-.aircraft-list {
-  display: grid;
-  gap: 6px;
-}
-.aircraft-row {
-  display: flex;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 7px 8px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.045);
-}
-.aircraft-row span {
-  min-width: 0;
-}
-.aircraft-row strong,
-.aircraft-row em {
-  display: block;
-}
-.aircraft-row strong {
-  font-size: 12px;
-}
-.aircraft-row em {
-  margin-top: 2px;
-  overflow: hidden;
-  color: #8e9ead;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-style: normal;
-  font-size: 11px;
-}
-.aircraft-row b {
-  flex: none;
-  align-self: start;
-  padding: 2px 6px;
-  border-radius: 999px;
-  color: #101419;
-  background: #aab7c4;
-  font-size: 11px;
-}
-.aircraft--online {
-  background: var(--accent-2) !important;
-}
-.aircraft--standby {
-  background: var(--accent) !important;
-}
-.aircraft--maintenance {
-  background: #ff9500 !important;
-}
-
-.bottom-dock {
-  left: 14px;
-  right: 14px;
-  bottom: 14px;
-  height: 136px;
-  display: grid;
-  grid-template-columns: 1.2fr 1.05fr 1.05fr 1.45fr;
-  gap: 14px;
-  padding: 14px;
-  box-sizing: border-box;
-  z-index: 5;
-}
-.playback,
-.airspace-load,
-.trend-card,
-.dock-card,
-.layer-controls,
-.render-controls {
-  min-width: 0;
-}
-.playback {
-  display: grid;
-  grid-template-columns: repeat(3, max-content);
-  align-content: start;
-  gap: 8px;
-}
-.industry-cards {
-  grid-column: 1 / -1;
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 7px;
-}
-.industry-cards--dock {
-  grid-column: auto;
-  height: 82px;
-}
-.industry-card {
-  min-width: 0;
-  padding: 8px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.055);
-  border: 1px solid rgba(255, 255, 255, 0.07);
-}
-.industry-card span,
-.industry-card em {
-  display: block;
-  font-size: 11px;
-}
-.industry-card span {
-  color: #8e9ead;
-}
-.industry-card strong {
-  display: block;
-  margin: 2px 0;
-  color: #f6fbff;
-  font-size: 18px;
-  font-variant-numeric: tabular-nums;
-}
-.industry-card em {
-  color: var(--accent-2);
-  font-style: normal;
-}
-.industry-card--warn em {
-  color: #ff9500;
-}
-.industry-card--neutral em {
-  color: #9fb2c5;
-}
-.dock-note {
-  grid-column: 1 / -1;
-  color: #91a0ad;
-  font-size: 11px;
-}
-.dock-title {
-  margin-bottom: 9px;
-  color: color-mix(in srgb, var(--accent) 58%, #d9f2ff 42%);
-  font-size: 12px;
-  font-weight: 700;
-}
-.dock-card {
-  min-height: 0;
-  padding: 0;
-  border: 0;
+.console .pin-del {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
   background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  color: var(--ink-dim);
+  cursor: pointer;
+  line-height: 1;
 }
-.dock-card p {
-  margin: 8px 0 0;
-  color: #8e9ead;
+.console .pin-del:hover {
+  color: var(--signal-2);
+  border-color: var(--signal);
+}
+.console .pin-empty,
+.console .seq-empty {
+  padding: 12px 4px;
   font-size: 11px;
-  line-height: 1.4;
+  color: var(--ink-dim);
+  text-align: center;
 }
-.compact-rule-list,
-.step-strip,
-.chain-inline {
-  display: grid;
-  gap: 7px;
+
+/* —— 序列表（场景③右栏）—— */
+.console .seq-panel {
+  min-height: 200px;
 }
-.compact-rule-list {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-.step-strip,
-.chain-inline {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-.capacity-row {
+.console .seq-table {
+  flex: 1 1 auto;
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 7px;
-  padding: 6px 8px;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.05);
-  font-size: 11px;
+  flex-direction: column;
+  border: 1px solid var(--line-soft);
+  border-radius: 2px;
+  overflow: hidden;
+  min-height: 0;
 }
-.capacity-row span {
+.console .seq-head {
+  display: flex;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line);
+  font-size: 10px;
+  color: var(--ink-dim);
+}
+.console .seq-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  min-height: 0;
+}
+.console .seq-row {
+  display: flex;
+  padding: 5px 8px;
+  font-size: 11px;
+  color: var(--ink);
+  border-bottom: 1px solid var(--line-soft);
+}
+.console .seq-row:last-child {
+  border-bottom: none;
+}
+.console .seq-row.conflict {
+  color: var(--signal-2);
+  background: rgba(200, 80, 58, 0.12);
+}
+.console .c-idx {
+  flex: 0 0 28px;
+  color: var(--ink-dim);
+}
+.console .seq-row .c-idx {
+  color: var(--ink-mid);
+}
+.console .c-code {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  color: #c5d2df;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.load-row {
-  display: grid;
-  grid-template-columns: 64px minmax(0, 1fr) 48px;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 6px;
-  font-size: 11px;
-}
-.load-row span {
-  overflow: hidden;
-  color: #c5d2df;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.load-row i {
-  height: 5px;
-  overflow: hidden;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.12);
-}
-.load-row b {
-  display: block;
-  height: 100%;
-  background: linear-gradient(90deg, var(--accent), #ffd60a, #ff453a);
-}
-.load-row em {
-  color: #8e9ead;
-  font-style: normal;
+.console .c-in,
+.console .c-out {
+  flex: 0 0 44px;
   text-align: right;
 }
-.trend-chart {
-  height: 92px;
-  display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  align-items: end;
-  gap: 8px;
+
+/* —— 冲突明细 —— */
+.console .conflict-list {
+  gap: 6px;
 }
-.trend-bar {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  align-items: end;
-  gap: 3px;
-  height: 92px;
-  position: relative;
-  padding-bottom: 18px;
+.console .conflict-item {
+  padding: 7px 9px;
+  border: 1px solid var(--signal);
+  border-radius: 2px;
+  background: rgba(200, 80, 58, 0.08);
 }
-.trend-bar span {
-  display: block;
-  border-radius: 3px 3px 0 0;
+.console .conflict-code {
+  font-size: 11px;
+  color: var(--signal-2);
+  word-break: break-all;
 }
-.trend-bar__sorties {
-  background: linear-gradient(180deg, var(--accent), rgba(var(--accent-rgb), 0.35));
+.console .conflict-pair {
+  font-size: 11px;
+  color: var(--ink);
+  margin-top: 3px;
 }
-.trend-bar__approvals {
-  background: linear-gradient(180deg, var(--accent-2), rgba(var(--accent-2-rgb), 0.32));
-}
-.trend-bar em {
-  position: absolute;
-  left: 50%;
-  bottom: 0;
-  color: #8e9ead;
-  transform: translateX(-50%);
-  font-style: normal;
+.console .conflict-win {
   font-size: 10px;
+  color: var(--ink-mid);
+  margin-top: 2px;
 }
-.layer-controls {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(74px, 1fr));
-  gap: 7px 10px;
-  align-content: center;
-}
-.layer-controls label {
+
+/* —— 签名十字丝 HUD —— */
+.console .reticle {
+  position: absolute;
+  left: 312px;
+  bottom: 42px;
+  z-index: 25;
+  pointer-events: none;
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 12px;
+  opacity: 0.5;
+  transition: opacity 0.2s;
+}
+.console .reticle.live {
+  opacity: 1;
+}
+.console .reticle-cross {
+  position: relative;
+  width: 46px;
+  height: 46px;
+  flex: 0 0 auto;
+}
+.console .cross-h,
+.console .cross-v {
+  position: absolute;
+  background: var(--phosphor);
+  opacity: 0.7;
+}
+.console .cross-h {
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  transform: translateY(-0.5px);
+}
+.console .cross-v {
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-0.5px);
+}
+.console .cross-dot {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--phosphor-2);
+  transform: translate(-50%, -50%);
+}
+.console .reticle.live .cross-dot {
+  box-shadow: 0 0 8px 2px rgba(216, 162, 74, 0.75);
+}
+.console .reticle-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 7px 11px;
+  min-width: 210px;
+}
+.console .reticle-label {
+  font-size: 10px;
+  color: var(--ink-dim);
+  letter-spacing: 0.5px;
+}
+.console .reticle-code {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--phosphor-2);
+  margin-top: 3px;
+  word-break: break-all;
+  text-shadow: 0 0 9px rgba(216, 162, 74, 0.45);
+}
+.console .reticle-coords {
+  font-size: 11px;
+  color: var(--ink-mid);
+  margin-top: 2px;
+}
+.console .reticle-idle {
   font-size: 12px;
-  color: #c5d2df;
-}
-.render-controls {
-  display: grid;
-  grid-template-columns: 1fr 122px 86px minmax(130px, 1fr) 92px;
-  gap: 10px;
-  align-items: center;
-}
-.render-controls .layer-controls {
-  grid-row: span 2;
-}
-.level-select {
-  width: 86px;
-}
-.opacity-control {
-  display: grid;
-  grid-template-columns: 48px minmax(0, 1fr);
-  gap: 8px;
-  align-items: center;
-  color: #c5d2df;
-  font-size: 12px;
-}
-.opacity-control--muted {
-  opacity: 0.55;
+  color: var(--ink-dim);
+  margin-top: 4px;
 }
 
-:deep(.el-button) {
-  font-weight: 700;
+/* —— 底状态条 —— */
+.console .statusbar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 14px;
+  background: var(--panel);
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+  color: var(--ink-mid);
+  z-index: 20;
 }
-:deep(.el-button.is-plain) {
-  background: rgba(255, 255, 255, 0.045);
-  border-color: rgba(160, 184, 204, 0.28);
-  color: #d7e6f5;
+.console .status-item b {
+  color: var(--phosphor);
+  font-weight: 500;
 }
-:deep(.el-radio-group) {
-  width: 100%;
+.console .status-item.dim,
+.console .status-item.dim b {
+  color: var(--ink-dim);
 }
-:deep(.el-radio-button__inner) {
-  width: 61px;
-  background: rgba(255, 255, 255, 0.045);
-  border-color: rgba(160, 184, 204, 0.25);
-  color: #c7d5e3;
+.console .status-item b.bad {
+  color: var(--signal-2);
 }
-:deep(.el-radio-button__original-radio:checked + .el-radio-button__inner) {
-  background: rgba(var(--accent-rgb), 0.26);
-  border-color: rgba(var(--accent-rgb), 0.72);
-  color: #ffffff;
+.console .status-item b.phos {
+  color: var(--phosphor-2);
 }
-:deep(.el-select__wrapper) {
-  background: rgba(255, 255, 255, 0.045);
-  box-shadow: 0 0 0 1px rgba(160, 184, 204, 0.25) inset;
+.console .status-sep {
+  color: var(--line);
 }
-:deep(.el-select__selected-item),
-:deep(.el-select__placeholder) {
-  color: #d7e6f5;
-}
-:deep(.el-slider__runway) {
-  background: rgba(255, 255, 255, 0.14);
-}
-:deep(.el-slider__bar) {
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
-}
-:deep(.el-slider__button) {
-  background: #121820;
-  border-color: var(--accent-2);
-}
-:deep(.el-progress-bar__outer) {
-  background: rgba(255, 255, 255, 0.12);
-}
-:deep(.el-progress-bar__inner) {
-  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+.console .status-spacer {
+  margin-left: auto;
 }
 
-@media (max-width: 1120px) {
-  .topbar {
-    gap: 10px;
+/* —— 滚动条 —— */
+.console .rail::-webkit-scrollbar,
+.console .seq-body::-webkit-scrollbar,
+.console .panel-grow ul::-webkit-scrollbar {
+  width: 8px;
+}
+.console .rail::-webkit-scrollbar-track,
+.console .seq-body::-webkit-scrollbar-track,
+.console .panel-grow ul::-webkit-scrollbar-track {
+  background: transparent;
+}
+.console .rail::-webkit-scrollbar-thumb,
+.console .seq-body::-webkit-scrollbar-thumb,
+.console .panel-grow ul::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 4px;
+}
+
+/* —— 响应式 —— */
+@media (max-width: 1180px) {
+  .console .rail-left {
+    width: 248px;
   }
-  .brand {
-    flex-basis: 300px;
+  .console .rail-right {
+    width: 264px;
   }
-  .brand p {
-    max-width: 220px;
+  .console .reticle {
+    left: 260px;
   }
-  .brand__badge {
-    display: none;
-  }
-  .kpis {
-    display: none;
-  }
-  .module-tabs {
-    display: flex;
-  }
-  .module-tab {
+  .console .tab {
     min-width: 64px;
-    padding: 0 6px;
-    font-size: 11px;
+    padding: 0 9px;
   }
-  .module-tab__sub {
-    display: none;
-  }
-  .module-banner {
-    left: 328px;
-    right: 344px;
-  }
-  .left-rail {
-    width: 300px;
-  }
-  .right-rail {
-    width: 330px;
-  }
-  .bottom-dock {
-    grid-template-columns: 1fr 1fr;
-  }
-  .trend-card,
-  .render-controls {
-    grid-column: 1 / -1;
-  }
-  .render-controls {
-    grid-template-columns: 1fr 122px 86px minmax(130px, 1fr) 92px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .console * {
+    transition: none !important;
   }
 }
 </style>
